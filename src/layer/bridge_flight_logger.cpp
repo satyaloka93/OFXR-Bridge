@@ -26,6 +26,18 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
 [[nodiscard]] const char* operation_name(
     BridgeFlightOperation operation) noexcept {
     switch (operation) {
+    case BridgeFlightOperation::synthesis_overlap_policy: return "synthesis_overlap_policy";
+    case BridgeFlightOperation::presenter_capacity_wait: return "presenter_capacity_wait";
+    case BridgeFlightOperation::presenter_completion_wait: return "presenter_completion_wait";
+    case BridgeFlightOperation::history_capture_skipped: return "history_capture_skipped";
+    case BridgeFlightOperation::nvidia_output_admission: return "nvidia_output_admission";
+    case BridgeFlightOperation::scheduling_experiment: return "scheduling_experiment";
+    case BridgeFlightOperation::synthesis_admission: return "synthesis_admission";
+    case BridgeFlightOperation::nvidia_queue_delay: return "nvidia_queue_delay";
+    case BridgeFlightOperation::dlss_guide_status: return "dlss_guide_status";
+    case BridgeFlightOperation::fidelity_input: return "fidelity_input";
+    case BridgeFlightOperation::fidelity_motion: return "fidelity_motion";
+    case BridgeFlightOperation::fidelity_present: return "fidelity_present";
     case BridgeFlightOperation::logger: return "logger";
     case BridgeFlightOperation::negotiation: return "negotiation";
     case BridgeFlightOperation::instance_create: return "instance_create";
@@ -177,6 +189,8 @@ struct BridgeFlightLogger::Impl {
     std::filesystem::path path;
     std::uint64_t bytes_written{};
     std::uint64_t maximum_bytes{32 * kMegabyte};
+    std::uint64_t segment{};
+    bool rotation_failed{};
     bool flush_each_event{};
     bool active{};
 
@@ -190,7 +204,7 @@ struct BridgeFlightLogger::Impl {
         std::uint64_t a,
         std::uint64_t b,
         std::uint64_t c) noexcept {
-        if (!active || file == INVALID_HANDLE_VALUE) {
+        if (!active) {
             return;
         }
 
@@ -219,12 +233,31 @@ struct BridgeFlightLogger::Impl {
         }
 
         AcquireSRWLockExclusive(&write_lock);
-        if (bytes_written + static_cast<std::uint64_t>(length) > maximum_bytes) {
-            LARGE_INTEGER beginning{};
-            if (SetFilePointerEx(file, beginning, nullptr, FILE_BEGIN) &&
-                SetEndOfFile(file)) {
-                bytes_written = 0;
+        if (!rotation_failed &&
+            bytes_written + static_cast<std::uint64_t>(length) > maximum_bytes) {
+            // Keep the original file and every completed segment. Sequence and
+            // elapsed-time origins span all files, including split begin/end pairs.
+            // Open first: a failed rotation must not discard the current handle.
+            try {
+                auto next_path = path;
+                next_path.replace_extension(
+                    L".part" + std::to_wstring(segment + 1) + L".log");
+                const HANDLE next_file = CreateFileW(
+                    next_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                    nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (next_file != INVALID_HANDLE_VALUE) {
+                    CloseHandle(file);
+                    file = next_file;
+                    ++segment;
+                    bytes_written = 0;
+                } else {
+                    rotation_failed = true;
+                }
+            } catch (...) {
+                rotation_failed = true;
             }
+            // If creating a segment fails, keep appending to the original
+            // handle, without repeated file-creation attempts on the frame path.
         }
         DWORD written = 0;
         if (WriteFile(

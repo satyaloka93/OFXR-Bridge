@@ -25,8 +25,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
+#include "../src/d3d12/fidelity_capture.hpp"
 
 namespace {
 
@@ -2564,6 +2566,7 @@ void test_stereo_motion_synthesis_beats_same_pixel_blend(
                 timing.previous_serial == capture_a.serial &&
                 timing.current_serial == capture_b.serial &&
                 timing.eye_count == kEyeCount &&
+                timing.queue_delay_valid &&
                 timing.total_microseconds >=
                     timing.pack_microseconds +
                         timing.composition_microseconds,
@@ -2572,6 +2575,7 @@ void test_stereo_motion_synthesis_beats_same_pixel_blend(
                   << " eye0_us=" << timing.eye0_microseconds
                   << " eye1_us=" << timing.eye1_microseconds
                   << " composition_us=" << timing.composition_microseconds
+                  << " queue_delay_us=" << timing.queue_delay_microseconds
                   << " total_us=" << timing.total_microseconds << '\n';
     }
     require(operation_succeeded(history->invalidate()), "motion history invalidate failed");
@@ -3561,6 +3565,118 @@ void test_double_wide_single_slice_views(
         "double-wide history invalidate failed");
 }
 
+void test_output_admission(
+    D3D12WarpFixture& fixture, xrfg::D3D12OpticalFlowBackend backend,
+    xrfg::D3D12NvidiaOpticalFlowOptions options = {}) {
+    constexpr UINT width = 1024, height = 512;
+    auto a = create_source_texture(fixture, width, height);
+    auto b = create_source_texture(fixture, width, height);
+    auto current0 = create_source_texture(fixture, width, height);
+    auto current1 = create_source_texture(fixture, width, height);
+    auto synthetic = create_source_texture(fixture, width, height);
+    const auto pattern_a = translated_motion_pattern(width, height, {0, 0});
+    const auto pattern_b = translated_motion_pattern(width, height, {16, -16});
+    const auto sentinel = translated_motion_pattern(width, height, {80, 80});
+    upload_pattern(fixture, a.Get(), pattern_a);
+    upload_pattern(fixture, b.Get(), pattern_b);
+    upload_pattern(fixture, current1.Get(), sentinel);
+    upload_pattern(fixture, synthetic.Get(), sentinel);
+    std::array<ID3D12Resource*, 2> sources{a.Get(), b.Get()};
+    std::array<ID3D12Resource*, 2> currents{current0.Get(), current1.Get()};
+    std::array<ID3D12Resource*, 1> synthetics{synthetic.Get()};
+    auto history = std::make_shared<xrfg::D3D12SwapchainHistory>();
+    require_hresult(history->initialize(fixture.device(), fixture.queue(), sources,
+        D3D12_RESOURCE_STATE_RENDER_TARGET), "admission history initialization");
+    xrfg::D3D12FrameSynthesizer synthesizer;
+    require_hresult(synthesizer.initialize(fixture.device(), fixture.queue(), history,
+        currents, synthetics, kFormat, D3D12_RESOURCE_STATE_RENDER_TARGET, backend, options),
+        "admission synthesis initialization");
+    const auto views = make_reprojection_views();
+    xrfg::D3D12HistoryCaptureTicket first{}, second{};
+    require_hresult(history->capture(0, &first), "admission first capture");
+    require_hresult(history->commit(first), "admission first commit");
+    xrfg::D3D12FrameSynthesisTicket ticket{};
+    require_hresult(synthesizer.submit_prime(first, views, 0, &ticket), "admission prime");
+    require_hresult(synthesizer.wait_for_previous_submission(5000), "admission prime wait");
+    require_hresult(history->capture(1, &second), "admission second capture");
+    require_hresult(history->commit(second), "admission second commit");
+    if (backend == xrfg::D3D12OpticalFlowBackend::nvidia) {
+        ComPtr<ID3D12Fence> producer_gate;
+        require_hresult(fixture.device()->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+            IID_PPV_ARGS(producer_gate.GetAddressOf())), "admission producer fence");
+        require_hresult(fixture.queue()->Wait(producer_gate.Get(), 1), "hold optical-flow producer");
+        bool saw_pending_flow = false;
+        xrfg::D3D12OutputAdmission cancel_pending{
+            [](void* opaque, ID3D12Fence* done, std::uint64_t value) noexcept -> HRESULT {
+                *static_cast<bool*>(opaque) = done && value && done->GetCompletedValue() < value;
+                return E_ABORT;
+            }, &saw_pending_flow};
+        std::thread unblock([&] { Sleep(200); producer_gate->Signal(1); });
+        const auto cancelled = synthesizer.submit_pair(second, views, views, 0, 1,
+            &ticket, std::nullopt, {}, cancel_pending);
+        const auto pending = synthesizer.wait_for_previous_submission(10);
+        unblock.join();
+        require(cancelled == E_ABORT && saw_pending_flow &&
+            pending == HRESULT_FROM_WIN32(ERROR_BUSY),
+            "cancelled preparation lost its outstanding GPU fence");
+        require_hresult(synthesizer.wait_for_previous_submission(5000), "pending cancellation drain");
+    }
+    struct Gate {
+        D3D12WarpFixture* fixture;
+        ID3D12Resource* current;
+        ID3D12Resource* synthetic;
+        const StereoPattern* sentinel;
+        bool expect_flow, cancel{true}, checked{};
+        unsigned calls{};
+    } gate{&fixture, current1.Get(), synthetic.Get(), &sentinel,
+        backend == xrfg::D3D12OpticalFlowBackend::nvidia};
+    xrfg::D3D12OutputAdmission admission{
+        [](void* opaque, ID3D12Fence* flow_done, std::uint64_t value) noexcept -> HRESULT {
+            auto& gate = *static_cast<Gate*>(opaque);
+            ++gate.calls;
+            try {
+                require((flow_done != nullptr) == gate.expect_flow,
+                    "flow submission happened on wrong side of admission");
+                // These readbacks drain the same graphics queue while output
+                // admission is held. Queued NVIDIA work may finish, but neither
+                // runtime output may have been written yet.
+                require(readback_pattern(*gate.fixture, gate.current,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET) == *gate.sentinel,
+                    "current image overwritten before admission");
+                require(readback_pattern(*gate.fixture, gate.synthetic,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET) == *gate.sentinel,
+                    "synthetic image overwritten before admission");
+                require(!flow_done || (value != 0 && flow_done->GetCompletedValue() >= value),
+                    "NVIDIA preparation did not complete during admission");
+                gate.checked = true;
+                return gate.cancel ? E_ABORT : S_OK;
+            } catch (...) { return E_FAIL; }
+        }, &gate};
+    require(synthesizer.submit_pair(second, views, views, 0, 1, &ticket,
+        std::nullopt, {}, admission) == E_ABORT && gate.checked && gate.calls == 1 &&
+        ticket.fence_value == 0, "cancelled admission was not preserved");
+    require_hresult(synthesizer.wait_for_previous_submission(5000), "cancelled preparation drain");
+    gate.cancel = false;
+    gate.checked = false;
+    require_hresult(synthesizer.submit_pair(second, views, views, 0, 1, &ticket,
+        std::nullopt, {}, admission), "retry after cancelled admission");
+    require(gate.checked && gate.calls == 2, "retry admission not invoked exactly once");
+    require_hresult(synthesizer.wait_for_previous_submission(5000), "admitted pair drain");
+    require(readback_pattern(fixture, current1.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET) == pattern_b,
+        "admitted current image differs from captured source");
+    upload_pattern(fixture, current1.Get(), sentinel);
+    upload_pattern(fixture, synthetic.Get(), sentinel);
+    gate.expect_flow = false;
+    gate.checked = false;
+    require_hresult(synthesizer.submit_pair(second, views, views, 0, 1, &ticket,
+        std::nullopt, {}, admission), "reused image admission");
+    require(gate.checked && gate.calls == 3, "reused image did not gate before writing");
+    require_hresult(synthesizer.wait_for_idle(), "admission final retirement");
+    require_hresult(history->invalidate(), "admission leaked an input lease");
+    fixture.require_no_debug_errors();
+    std::cout << "Output admission: queued preparation, untouched outputs, cancellation/retry and reuse passed\n";
+}
+
 void test_submission_backpressure_and_recovery(
     D3D12WarpFixture& fixture,
     xrfg::D3D12OpticalFlowBackend backend,
@@ -3825,6 +3941,40 @@ int main() {
             return 0;
         }
         D3D12WarpFixture fixture;
+        {
+            auto texture = create_source_texture(fixture);
+            const auto pattern = make_pattern(37);
+            upload_pattern(fixture, texture.Get(), pattern);
+            std::vector<xrfg::FidelityReadback> captures;
+            const auto folder = std::filesystem::temp_directory_path() /
+                ("ofxr-fidelity-test-" + std::to_string(GetCurrentProcessId()));
+            const auto path = folder / "stereo.raw";
+            fixture.execute_and_wait([&](ID3D12GraphicsCommandList* commands) {
+                xrfg::record_fidelity_texture(fixture.device(), commands, texture.Get(),
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, path, captures);
+            });
+            require(captures.size() == 1, "fidelity readback not allocated");
+            const auto layouts = captures.front().layouts;
+            captures.front().pair_metadata = "capture-test";
+            xrfg::finish_fidelity_capture(captures);
+            require(captures.empty(), "completed readbacks not released");
+            std::ifstream raw(path, std::ios::binary);
+            std::vector<char> bytes{std::istreambuf_iterator<char>(raw), {}};
+            for (unsigned eye = 0; eye < kEyeCount; ++eye) {
+                for (unsigned y = 0; y < kHeight; ++y) {
+                    const auto offset = layouts[eye].Offset + y * layouts[eye].Footprint.RowPitch;
+                    require(bytes.size() >= offset + kWidth * 4, "truncated fidelity capture");
+                    require(std::memcmp(bytes.data() + offset, pattern[eye].data() + y * kWidth * 4,
+                        kWidth * 4) == 0, "fidelity capture changed stereo pixels");
+                }
+            }
+            require(readback_pattern(fixture, texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET) == pattern,
+                "fidelity capture changed source or failed to restore resource state");
+            require(std::filesystem::exists(path.string() + ".json"), "missing footprints");
+            require(std::filesystem::exists(folder / "pair.txt"), "missing capture IDs");
+            raw.close();
+            std::filesystem::remove_all(folder);
+        }
         test_stereo_capture_ring(fixture);
         test_capture_is_async_and_consumer_fence_blocks_reuse(fixture);
         test_depth_capture_path(fixture);
@@ -3836,6 +3986,7 @@ int main() {
         test_dlss_motion_vector_gpu_ingress(fixture);
         test_dlss_motion_vector_strafe_rejects_double_edges(fixture);
         test_rotation_aware_synthesis_beats_uncompensated_flow(fixture);
+        test_output_admission(fixture, xrfg::D3D12OpticalFlowBackend::fidelity_fx);
         test_submission_backpressure_and_recovery(
             fixture,
             xrfg::D3D12OpticalFlowBackend::fidelity_fx);
@@ -3902,6 +4053,7 @@ int main() {
             test_dlss_motion_vector_gpu_ingress(
                 nvidia_fixture,
                 xrfg::D3D12OpticalFlowBackend::nvidia);
+            test_output_admission(nvidia_fixture, xrfg::D3D12OpticalFlowBackend::nvidia, nvidia_options);
             test_submission_backpressure_and_recovery(
                 nvidia_fixture,
                 xrfg::D3D12OpticalFlowBackend::nvidia,

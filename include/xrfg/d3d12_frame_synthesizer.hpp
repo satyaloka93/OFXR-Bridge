@@ -16,6 +16,16 @@
 
 namespace xrfg {
 
+// Invoked synchronously before any output-writing command list is submitted.
+// NVIDIA may already have queued internal packing/flow work. Must not re-enter
+// this synthesizer. Context must outlive submit_pair; no callback is retained.
+struct D3D12OutputAdmission {
+    // A non-null fence/value identifies queued NVIDIA flow completion. Other
+    // paths pass nullptr/0. The borrowed fence is valid only during the call.
+    HRESULT (*wait)(void*, ID3D12Fence*, std::uint64_t) noexcept {};
+    void* context{};
+};
+
 struct D3D12FieldOfView {
     float angle_left{};
     float angle_right{};
@@ -65,6 +75,8 @@ struct D3D12NvidiaGpuTiming {
     std::uint64_t eye1_microseconds{};
     std::uint64_t composition_microseconds{};
     std::uint64_t total_microseconds{};
+    std::uint64_t queue_delay_microseconds{};
+    bool queue_delay_valid{};
     std::uint32_t eye_count{};
 };
 
@@ -144,7 +156,8 @@ public:
         std::uint32_t current_destination_index,
         D3D12FrameSynthesisTicket* ticket,
         std::optional<OverlayPlacement> debug_marker = std::nullopt,
-        std::shared_ptr<const DlssMotionVectorSet> motion_vectors = {}) noexcept;
+        std::shared_ptr<const DlssMotionVectorSet> motion_vectors = {},
+        D3D12OutputAdmission output_admission = {}) noexcept;
 
     // Relinquishes the retained rolling source against its last GPU-use fence.
     // This is nonblocking and is required before history invalidation.

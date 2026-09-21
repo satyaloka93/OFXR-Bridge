@@ -1,6 +1,10 @@
 #include "xrfg/d3d12_history.hpp"
 #include "xrfg/d3d12_frame_synthesizer.hpp"
 #include "xrfg/dlss_motion_vectors.hpp"
+#include "xrfg/process_lifetime.hpp"
+#include "xrfg/adaptive_overlap.hpp"
+#include "xrfg/scheduling_experiment.hpp"
+#include "xrfg/history_capture_selection.hpp"
 #include "xrfg/d3d11_d3d12_interop.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
 #include "xrfg/generation_backpressure.hpp"
@@ -422,7 +426,9 @@ enum class GenerationQuarantineReason : std::int64_t {
 
 struct SessionState {
     explicit SessionState(std::shared_ptr<Dispatch> next_dispatch)
-        : dispatch(std::move(next_dispatch)), manual_control(current_layer_directory()) {}
+         : dispatch(std::move(next_dispatch)), manual_control(current_layer_directory()),
+          scheduling_experiment(GetPrivateProfileIntW(L"scheduling", L"mode", 0,
+              (current_layer_directory() / L"ofxr-scheduling.ini").c_str())) {}
 
     ~SessionState() {
         xrfg::embedded::detach(control_id);
@@ -450,6 +456,14 @@ struct SessionState {
     std::mutex frame_call_mutex;
     std::condition_variable frame_call_condition;
     bool application_wait_pending_begin{};
+    // One application frame may prepare while the preceding synthesis retires.
+    // Capture/end-frame remains the fence boundary; pipelined callers opt out.
+    std::atomic<bool> defer_synthesis_wait{};
+    std::atomic<bool> selective_history_capture{};
+    bool reported_synthesis_overlap{}; // frame_call_mutex
+    xrfg::AdaptiveOverlap overlap_policy; // frame_call_mutex
+    xrfg::SchedulingExperiment scheduling_experiment; // frame_call_mutex
+    unsigned reported_schedule{~0u}, reported_schedule_phase{~0u};
     // Some applications run the next wait on a dedicated thread before the
     // current render thread ends its frame. Two consecutive overlaps select a
     // virtual application loop; the runtime-facing presenter then owns all
@@ -547,9 +561,9 @@ struct PrivateSwapchainState {
 // released last when xrEndFrame runs, so one shared swapchain would repoint
 // that queued frame at the newer image.
 //
-// The synthetic output needs no second slot. It is always the first of the
-// pair to be submitted, so it has already left the queue by the time the
-// application is admitted to build the next pair.
+// SteamVR D3D12 also allocates an optional alternate synthetic output. It lets
+// synthesis prepare before the preceding synthetic is presented. Other paths
+// keep the single synthetic output and wait before preparation.
 constexpr std::size_t kCurrentSlotCount = 2;
 
 struct FrameGenerationSwapchainState {
@@ -559,6 +573,8 @@ struct FrameGenerationSwapchainState {
     std::uint32_t current_images_per_slot{};
     std::size_t current_slot{};
     PrivateSwapchainState synthetic;
+    PrivateSwapchainState synthetic_alternate;
+    std::uint32_t synthetic_images_per_slot{};
     std::shared_ptr<xrfg::D3D12FrameSynthesizer> synthesizer;
     std::shared_ptr<xrfg::D3D11D3D12SwapchainInterop> d3d11_interop;
 };
@@ -581,6 +597,11 @@ void log_completed_nvidia_gpu_timings(
                 result);
             return;
         }
+        xrfg::bridge_flight_logger().event(
+            xrfg::BridgeFlightOperation::nvidia_queue_delay,
+            timing.queue_delay_valid ? 0 : 1,
+            timing.queue_delay_microseconds, timing.total_microseconds,
+            timing.current_serial);
         xrfg::bridge_flight_logger().event(
             xrfg::BridgeFlightOperation::nvidia_gpu_stages,
             timing.eye_count,
@@ -643,6 +664,7 @@ struct SwapchainState {
     std::deque<std::uint32_t> acquired_indices;
     bool front_waited{};
     bool ownership_tracking_valid{true};
+    xrfg::HistoryCaptureSelection capture_selection; // mutex
     std::optional<std::uint32_t> last_released_index;
     std::shared_ptr<xrfg::D3D12SwapchainHistory> d3d12_history;
     std::vector<Microsoft::WRL::ComPtr<ID3D11Texture2D>> enumerated_d3d11_images;
@@ -665,10 +687,19 @@ void log_swapchain_eligibility(
         auxiliary);
 }
 
-std::mutex g_state_mutex;
-std::unordered_map<XrInstance, std::shared_ptr<Dispatch>> g_instances;
-std::unordered_map<XrSession, std::shared_ptr<SessionState>> g_sessions;
-std::unordered_map<XrSwapchain, std::shared_ptr<SwapchainState>> g_swapchains;
+struct LayerRegistry {
+    std::mutex mutex;
+    std::unordered_map<XrInstance, std::shared_ptr<Dispatch>> instances;
+    std::unordered_map<XrSession, std::shared_ptr<SessionState>> sessions;
+    std::unordered_map<XrSwapchain, std::shared_ptr<SwapchainState>> swapchains;
+};
+// Never let CRT destruction invoke overlay xrDestroySwapchain through a layer
+// that has already detached. Explicit OpenXR destruction below remains unchanged.
+auto& g_registry = xrfg::process_lifetime<LayerRegistry>();
+auto& g_state_mutex = g_registry.mutex;
+auto& g_instances = g_registry.instances;
+auto& g_sessions = g_registry.sessions;
+auto& g_swapchains = g_registry.swapchains;
 
 template <typename Function>
 [[nodiscard]] XrResult guard_c_api_boundary(Function&& function) noexcept {
@@ -912,13 +943,15 @@ void destroy_frame_generation_swapchains(
 
         const auto& dispatch = state->session->dispatch;
         static_cast<void>(release_private_image(dispatch, generation->synthetic));
+        static_cast<void>(release_private_image(dispatch, generation->synthetic_alternate));
         for (PrivateSwapchainState& image : generation->current) {
             static_cast<void>(release_private_image(dispatch, image));
         }
         if (dispatch->destroy_swapchain == nullptr) {
             return;
         }
-        std::array<PrivateSwapchainState*, kCurrentSlotCount + 1> owned{};
+        std::array<PrivateSwapchainState*, kCurrentSlotCount + 2> owned{};
+        owned[kCurrentSlotCount + 1] = &generation->synthetic_alternate;
         owned[0] = &generation->synthetic;
         for (std::size_t slot = 0; slot < kCurrentSlotCount; ++slot) {
             owned[slot + 1] = &generation->current[slot];
@@ -1109,6 +1142,7 @@ create_d3d12_frame_generation_swapchains(
     std::uint64_t* failure_detail) {
     CreatedCurrentRing current;
     CreatedPrivateSwapchain synthetic;
+    CreatedPrivateSwapchain alternate;
     if (failure_reason != nullptr) {
         *failure_reason = SwapchainEligibilityReason::exception;
     }
@@ -1167,6 +1201,26 @@ create_d3d12_frame_generation_swapchains(
             return nullptr;
         }
 
+        const auto synthetic_stride = static_cast<std::uint32_t>(synthetic.d3d12_resources.size());
+        // Optional second output for SteamVR's continuous presenter. Failure
+        // retains the original single-output path and its stricter queue gate.
+        // Experimental: eager allocation prevented UEVR from creating later
+        // application swapchains in both SHf and TOW2. Keep opt-in only until
+        // allocation is deferred and the runtime resource limit is accounted for.
+        wchar_t experimental_prepare_ahead[2]{};
+        const bool prepare_ahead_enabled = GetEnvironmentVariableW(
+            L"OFXR_EXPERIMENTAL_PREPARE_AHEAD", experimental_prepare_ahead, 2) == 1 &&
+            experimental_prepare_ahead[0] == L'1';
+        if (dispatch->steamvr_runtime && prepare_ahead_enabled) {
+            if (create_private_swapchain(state, private_info, &alternate) &&
+                alternate.d3d12_resources.size() == synthetic_stride) {
+                synthetic.d3d12_resources.insert(synthetic.d3d12_resources.end(),
+                    alternate.d3d12_resources.begin(), alternate.d3d12_resources.end());
+            } else if (alternate.state.handle != XR_NULL_HANDLE) {
+                dispatch->destroy_swapchain(alternate.state.handle);
+                alternate.state.handle = XR_NULL_HANDLE;
+            }
+        }
         auto synthesizer = std::make_shared<xrfg::D3D12FrameSynthesizer>();
         const xrfg::D3D12OpticalFlowBackend backend =
             state->session->optical_flow_backend;
@@ -1209,6 +1263,10 @@ create_d3d12_frame_generation_swapchains(
             if (failure_detail != nullptr) {
                 *failure_detail = static_cast<std::uint64_t>(gpu_result);
             }
+            if (alternate.state.handle != XR_NULL_HANDLE) {
+                dispatch->destroy_swapchain(alternate.state.handle);
+                alternate.state.handle = XR_NULL_HANDLE;
+            }
             dispatch->destroy_swapchain(synthetic.state.handle);
             synthetic.state.handle = XR_NULL_HANDLE;
             destroy_current_ring(dispatch, &current);
@@ -1218,6 +1276,8 @@ create_d3d12_frame_generation_swapchains(
         auto generation = std::make_shared<FrameGenerationSwapchainState>();
         adopt_current_ring(generation, current);
         generation->synthetic = synthetic.state;
+        generation->synthetic_alternate = alternate.state;
+        generation->synthetic_images_per_slot = synthetic_stride;
         generation->synthesizer = std::move(synthesizer);
         if (failure_reason != nullptr) {
             *failure_reason = SwapchainEligibilityReason::ready;
@@ -1226,6 +1286,9 @@ create_d3d12_frame_generation_swapchains(
     } catch (...) {
         if (state && state->session && state->session->dispatch &&
             state->session->dispatch->destroy_swapchain != nullptr) {
+            if (alternate.state.handle != XR_NULL_HANDLE) {
+                state->session->dispatch->destroy_swapchain(alternate.state.handle);
+            }
             if (synthetic.state.handle != XR_NULL_HANDLE) {
                 state->session->dispatch->destroy_swapchain(synthetic.state.handle);
             }
@@ -1916,9 +1979,12 @@ XrResult layer_destroy_session_impl(XrSession session) {
 }
 
 void reset_frame_bookkeeping(const std::shared_ptr<SessionState>& state) {
+    state->defer_synthesis_wait.store(false, std::memory_order_release);
+    state->selective_history_capture.store(false, std::memory_order_release);
     if (state->fps_overlay) state->fps_overlay->reset_metrics();
     {
         std::scoped_lock frame_call_lock(state->frame_call_mutex);
+        state->overlap_policy.reset();
         state->application_wait_pending_begin = false;
         state->application_frame_in_progress = false;
         state->application_frame_has_overlapping_wait = false;
@@ -2038,6 +2104,8 @@ XrResult layer_wait_frame_impl(
     state->frame_call_condition.wait(frame_call_lock, [&] {
         return !state->application_wait_pending_begin;
     });
+    const auto admission_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
     XrResult result = XR_SUCCESS;
     const bool use_continuous_presenter = continuous_presenter_active(state);
     bool use_provisional_pipelined_wait = false;
@@ -2053,6 +2121,7 @@ XrResult layer_wait_frame_impl(
             // closes that boundary. Return the first virtual wait now and
             // preserve its timeline when the presenter starts at that end.
             state->pipelined_presenter_mode = true;
+            state->selective_history_capture.store(false, std::memory_order_release);
             state->pipelined_presenter_start_requested = true;
             use_provisional_pipelined_wait = true;
         }
@@ -2133,12 +2202,45 @@ XrResult layer_wait_frame_impl(
         }
     }
     if (XR_SUCCEEDED(result) && frame_state != nullptr) {
-        // V090 replaces V089's late submit-time wait with a frame-start gate.
-        // This is after runtime pacing but before the application can record
-        // or enqueue its next game/NGX workload. The submit path now performs
-        // only a nonblocking check and drops generation while the same fence
-        // remains pending, so a timeout cannot grow the queue.
-        static_cast<void>(wait_for_previous_session_synthesis(state));
+        // Continuous, non-pipelined callers may prepare ONE next game frame
+        // before the previous synthesis fence retires. Wait at image release
+        // (or end-frame for reused images), before the next history capture.
+        // Inline/pipelined callers retain the original frame-start gate.
+        const bool eligible = use_continuous_presenter && !state->pipelined_presenter_mode &&
+            !state->application_frame_in_progress && state->menu_enabled &&
+            !state->manual_control.stop_requested();
+        const unsigned schedule = state->scheduling_experiment.select(admission_time_us, eligible);
+        const unsigned phase = state->scheduling_experiment.phase();
+        if (schedule != state->reported_schedule || phase != state->reported_schedule_phase) {
+            state->overlap_policy.reset();
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::scheduling_experiment,
+                schedule, state->scheduling_experiment.requested(), phase, eligible ? 1 : 0);
+            state->reported_schedule = schedule;
+            state->reported_schedule_phase = phase;
+        }
+        const auto old_mode = state->overlap_policy.mode();
+        const bool overlap = schedule == 0
+            ? state->overlap_policy.select(admission_time_us,
+                frame_state->predictedDisplayPeriod / 1000, eligible)
+            : eligible && schedule == 2;
+        if (old_mode != state->overlap_policy.mode()) {
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::synthesis_overlap_policy,
+                static_cast<std::int64_t>(state->overlap_policy.mode()),
+                state->overlap_policy.mean_us(), state->overlap_policy.baseline_us(),
+                frame_state->predictedDisplayPeriod / 1000);
+        }
+        if (overlap != state->reported_synthesis_overlap) {
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::synthesis_admission,
+                overlap ? 1 : 0, handle_value(session));
+            state->reported_synthesis_overlap = overlap;
+        }
+        state->defer_synthesis_wait.store(overlap, std::memory_order_release);
+        if (!overlap) {
+            static_cast<void>(wait_for_previous_session_synthesis(state));
+        }
         state->application_wait_pending_begin = true;
         std::scoped_lock lock(state->mutex);
         if (state->dispatch->steamvr_runtime &&
@@ -2656,7 +2758,14 @@ XrResult layer_release_swapchain_image_impl(
         if (state->ownership_tracking_valid && state->front_waited &&
             !state->acquired_indices.empty()) {
             candidate_index = state->acquired_indices.front();
-            history = state->d3d12_history;
+            if (state->capture_selection.capture(
+                    state->session->selective_history_capture.load(std::memory_order_acquire))) {
+                history = state->d3d12_history;
+            } else if (state->d3d12_history) {
+                xrfg::bridge_flight_logger().event(
+                    xrfg::BridgeFlightOperation::history_capture_skipped,
+                    0, handle_value(swapchain), *candidate_index, 0);
+            }
             if (state->frame_generation) {
                 d3d11_interop = state->frame_generation->d3d11_interop;
             }
@@ -2671,6 +2780,11 @@ XrResult layer_release_swapchain_image_impl(
         d3d11_interop.reset();
     }
     if (candidate_index && history) {
+        if (state->session->defer_synthesis_wait.load(std::memory_order_acquire)) {
+            // Do not hold gpu_mutex while waiting. The submit path still checks
+            // completion, and capture still checks exclusive history ownership.
+            static_cast<void>(wait_for_previous_session_synthesis(state->session));
+        }
         gpu_lock = std::unique_lock<std::mutex>(state->session->gpu_mutex);
     }
 
@@ -3234,6 +3348,14 @@ void continuous_presenter_main(
                 submitted.layerCount,
                 frame_state.shouldRender);
         }
+        const auto diagnostic_frame = request ? request->owned_frame : repeated_frame;
+        xrfg::bridge_flight_logger().event(
+            xrfg::BridgeFlightOperation::fidelity_present,
+            (request ? 1 : 0) | (diagnostic_frame && diagnostic_frame->synthetic ? 2 : 0) |
+                (submitted_layer_count ? 4 : 0) | (XR_FAILED(end_result) ? 8 : 0),
+            diagnostic_frame ? static_cast<std::uint64_t>(diagnostic_frame->info.displayTime) : 0,
+            static_cast<std::uint64_t>(frame_state.predictedDisplayTime),
+            request ? request->sequence : 0);
         xrfg::bridge_flight_logger().event(
             xrfg::BridgeFlightOperation::presenter_submission,
             end_result,
@@ -3373,12 +3495,23 @@ void stop_continuous_presenter(
     std::size_t maximum_outstanding) noexcept {
     try {
         std::unique_lock lock(state->presenter_mutex);
+        auto& flight = xrfg::bridge_flight_logger();
+        const auto token = state->outstanding_presenter_submissions > maximum_outstanding
+            ? flight.begin(xrfg::BridgeFlightOperation::presenter_capacity_wait,
+                handle_value(state->handle), maximum_outstanding,
+                state->outstanding_presenter_submissions)
+            : xrfg::BridgeFlightToken{};
         state->presenter_condition.wait(lock, [&] {
             return state->outstanding_presenter_submissions <=
                        maximum_outstanding ||
                    XR_FAILED(state->presenter_failure) ||
                    state->presenter_stop_requested;
         });
+        flight.end(token, xrfg::BridgeFlightOperation::presenter_capacity_wait,
+            XR_FAILED(state->presenter_failure) ? state->presenter_failure :
+                state->presenter_stop_requested ? XR_ERROR_SESSION_NOT_RUNNING : XR_SUCCESS,
+            handle_value(state->handle), maximum_outstanding,
+            state->outstanding_presenter_submissions);
         if (XR_FAILED(state->presenter_failure)) {
             return state->presenter_failure;
         }
@@ -3454,10 +3587,20 @@ enqueue_presenter_submission(
     const std::shared_ptr<PresenterSubmission>& request) noexcept {
     try {
         std::unique_lock lock(state->presenter_mutex);
+        auto& flight = xrfg::bridge_flight_logger();
+        const auto token = !request->completed
+            ? flight.begin(xrfg::BridgeFlightOperation::presenter_completion_wait,
+                handle_value(state->handle), request->sequence, 0)
+            : xrfg::BridgeFlightToken{};
         state->presenter_condition.wait(lock, [&] {
             return request->completed || XR_FAILED(state->presenter_failure) ||
                    state->presenter_stop_requested;
         });
+        flight.end(token, xrfg::BridgeFlightOperation::presenter_completion_wait,
+            request->completed ? request->result :
+                XR_FAILED(state->presenter_failure) ? state->presenter_failure :
+                    XR_ERROR_SESSION_NOT_RUNNING,
+            handle_value(state->handle), request->sequence, request->completed ? 1 : 0);
         return request->completed
             ? request->result
             : XR_FAILED(state->presenter_failure)
@@ -4117,7 +4260,8 @@ struct PreparedProjectionFrame {
 [[nodiscard]] PreparedGeneration prepare_frame_generation(
     XrSwapchain application_swapchain,
     bool request_pair,
-    std::span<const xrfg::D3D12ReprojectionView> current_source_views) noexcept {
+    std::span<const xrfg::D3D12ReprojectionView> current_source_views,
+    xrfg::D3D12OutputAdmission output_admission = {}) noexcept {
     PreparedGeneration output{};
     try {
         const auto state = find_swapchain(application_swapchain);
@@ -4144,11 +4288,39 @@ struct PreparedProjectionFrame {
             output.reason = GenerationPrepareReason::missing_capture;
             return output;
         }
+        // Capture serials are scoped to this application swapchain.
+        if (xrfg::bridge_flight_logger().enabled()) {
+            if (capture->serial % 120 == 0) {
+                const auto guides = xrfg::dlss_motion_vector_statistics();
+                xrfg::bridge_flight_logger().event(
+                    xrfg::BridgeFlightOperation::dlss_guide_status,
+                    static_cast<std::int64_t>(guides.status),
+                    guides.published, guides.matched, guides.used);
+            }
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::fidelity_input,
+                request_pair ? 1 : 0, handle_value(application_swapchain),
+                capture->serial, capture->source_index);
+            if (motion_vectors) {
+                for (std::uint32_t eye = 0; eye < motion_vectors->eye_count &&
+                     eye < motion_vectors->eyes.size(); ++eye) {
+                    const auto& mv = motion_vectors->eyes[eye];
+                    if (!mv) continue;
+                    xrfg::bridge_flight_logger().event(
+                        xrfg::BridgeFlightOperation::fidelity_motion,
+                        eye, mv->stream, mv->serial, mv->publication);
+                }
+            }
+        }
         const std::size_t current_slot = generation->current_slot;
+        const bool alternate_synthetic = current_slot != 0 &&
+            generation->synthetic_alternate.handle != XR_NULL_HANDLE;
+        PrivateSwapchainState& synthetic_image = alternate_synthetic
+            ? generation->synthetic_alternate : generation->synthetic;
         PrivateSwapchainState& current_image =
             generation->current[current_slot];
         if (current_image.handle == XR_NULL_HANDLE ||
-            generation->synthetic.handle == XR_NULL_HANDLE ||
+            synthetic_image.handle == XR_NULL_HANDLE ||
             generation->current_images_per_slot == 0) {
             output.reason = GenerationPrepareReason::invalid_private_swapchain;
             return output;
@@ -4177,7 +4349,7 @@ struct PreparedProjectionFrame {
         if (request_pair &&
             !acquire_and_wait_private_image(
                 state->session->dispatch,
-                generation->synthetic)) {
+                synthetic_image)) {
             output.reason =
                 GenerationPrepareReason::synthetic_private_acquire_failed;
             static_cast<void>(release_private_image(
@@ -4193,6 +4365,9 @@ struct PreparedProjectionFrame {
                 generation->current_images_per_slot +
             current_image.acquired_index;
 
+        const std::uint32_t synthetic_destination_index =
+            (alternate_synthetic ? generation->synthetic_images_per_slot : 0) +
+            synthetic_image.acquired_index;
         xrfg::D3D12FrameSynthesisTicket ticket{};
         const auto debug_marker = request_pair && xrfg::bridge_flight_logger().enabled() &&
                 state->session->fps_overlay
@@ -4207,7 +4382,7 @@ struct PreparedProjectionFrame {
             handle_value(application_swapchain),
             capture->serial,
             (static_cast<std::uint64_t>(
-                 generation->synthetic.acquired_index) << 32) |
+                 synthetic_image.acquired_index) << 32) |
                 current_destination_index);
         {
             std::scoped_lock gpu_lock(state->session->gpu_mutex);
@@ -4222,11 +4397,12 @@ struct PreparedProjectionFrame {
                                           *capture,
                                           current_source_views,
                                           current_source_views,
-                                          generation->synthetic.acquired_index,
+                                          synthetic_destination_index,
                                           current_destination_index,
                                           &ticket,
                                           debug_marker,
-                                          motion_vectors)
+                                          motion_vectors,
+                                          output_admission)
                                     : generation->synthesizer->submit_prime(
                                           *capture,
                                           current_source_views,
@@ -4239,14 +4415,14 @@ struct PreparedProjectionFrame {
                     xrfg::BridgeFlightOperation::d3d11_publish,
                     handle_value(application_swapchain),
                     current_destination_index,
-                    request_pair ? generation->synthetic.acquired_index
+                    request_pair ? synthetic_image.acquired_index
                                  : std::numeric_limits<std::uint32_t>::max());
                 const HRESULT publish_result =
                     generation->d3d11_interop->publish(
                         current_destination_index,
                         request_pair
                             ? std::optional<std::uint32_t>(
-                                  generation->synthetic.acquired_index)
+                                  synthetic_image.acquired_index)
                             : std::nullopt);
                 xrfg::bridge_flight_logger().end(
                     publish_token,
@@ -4254,7 +4430,7 @@ struct PreparedProjectionFrame {
                     publish_result,
                     handle_value(application_swapchain),
                     current_destination_index,
-                    request_pair ? generation->synthetic.acquired_index
+                    request_pair ? synthetic_image.acquired_index
                                  : std::numeric_limits<std::uint32_t>::max());
                 if (FAILED(publish_result)) {
                     static_cast<void>(generation->synthesizer->retire_previous());
@@ -4274,7 +4450,7 @@ struct PreparedProjectionFrame {
         if (request_pair) {
             synthetic_released = release_private_image(
                 state->session->dispatch,
-                generation->synthetic);
+                synthetic_image);
         }
         const bool current_released = release_private_image(
             state->session->dispatch,
@@ -4291,7 +4467,7 @@ struct PreparedProjectionFrame {
 
         output.anchor_is_current = true;
         output.current_handle = current_image.handle;
-        output.synthetic_handle = generation->synthetic.handle;
+        output.synthetic_handle = synthetic_image.handle;
         if (current_released && synthetic_released) {
             // Hand the next frame the other slot, so it can release its output
             // while this one is still queued behind the presenter.
@@ -4314,7 +4490,8 @@ struct PreparedProjectionFrame {
 [[nodiscard]] PreparedProjectionFrame prepare_projection_frame(
     const ProjectionSnapshot& snapshot,
     std::span<const ProjectionResourceMapping> mappings,
-    bool request_pair) noexcept {
+    bool request_pair,
+    xrfg::D3D12OutputAdmission output_admission = {}) noexcept {
     PreparedProjectionFrame output{};
     try {
         if (mappings.empty()) {
@@ -4340,7 +4517,7 @@ struct PreparedProjectionFrame {
                 request_pair,
                 std::span<const xrfg::D3D12ReprojectionView>(
                     reprojection_views->data(),
-                    reprojection_views->size()));
+                    reprojection_views->size()), output_admission);
             all_expected_kind =
                 all_expected_kind && generation.kind == expected_kind;
             all_anchor_current =
@@ -4758,6 +4935,11 @@ XrResult layer_end_frame_impl(
     }
 
     std::scoped_lock frame_call_lock(state->frame_call_mutex);
+    if (state->defer_synthesis_wait.exchange(false, std::memory_order_acq_rel)) {
+        // A legal frame can reuse its last image without releasing a new one.
+        // Keep the same bound for that path, including empty/invalid end calls.
+        static_cast<void>(wait_for_previous_session_synthesis(state));
+    }
     const auto application_end_now = std::chrono::steady_clock::now();
     const bool frame_had_overlapping_wait =
         state->application_frame_has_overlapping_wait;
@@ -4948,6 +5130,19 @@ XrResult layer_end_frame_impl(
         }
         return bypass_generation(GenerationPrepareReason::empty_mappings);
     }
+    // Learn before any layout-change quarantine or missing-capture bypass.
+    // A newly selected source may have skipped its latest release: that release
+    // cleared last_released_capture, so it safely bypasses until a fresh capture.
+    for (const auto& mapping : resource_mappings.mappings) {
+        if (const auto source = find_swapchain(mapping.application_swapchain)) {
+            std::scoped_lock source_lock(source->mutex);
+            source->capture_selection.observe_projection();
+        }
+    }
+    state->selective_history_capture.store(
+        !pipelined_presenter_mode &&
+            state->graphics_binding == SessionGraphicsBinding::d3d12,
+        std::memory_order_release);
     const std::optional<XrDuration> application_display_period =
         latest_pending_application_period(
             state,
@@ -4980,19 +5175,44 @@ XrResult layer_end_frame_impl(
         // one-second outage.
         clear_generation_continuity(state);
     }
-    // Admit this frame once the presenter has taken the previous pair's
-    // synthetic, leaving only its current submission outstanding.
-    //
-    // Waiting for the queue to empty instead spent half the available budget:
-    // the application was released only after the second of two paced
-    // submissions and still had to enqueue before the very next slot, so it
-    // had one display period to render a frame that two periods were available
-    // for. Admitting it a slot earlier is what the alternating current
-    // swapchain exists to make safe -- the previous pair's queued current
-    // frame names the other slot, and its synthetic has already left the
-    // queue, so neither can be repointed by the release below.
+    // A single synthetic swapchain must wait until the preceding synthetic
+    // has been submitted. With two complete output sets, prepare into the
+    // other set first and retain that same admission bound at handoff below.
+    const bool early_optical_flow = use_continuous_presenter && !pipelined_presenter_mode &&
+        metadata_pairable && resource_mappings.mappings.size() == 1 &&
+        state->graphics_binding == SessionGraphicsBinding::d3d12 &&
+        state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia;
+    struct OutputAdmissionContext {
+        std::shared_ptr<SessionState> session;
+        XrResult result{XR_SUCCESS};
+    } admission_context{state};
+    xrfg::D3D12OutputAdmission output_admission{};
+    if (early_optical_flow) {
+        output_admission.context = &admission_context;
+        output_admission.wait = [](void* opaque, ID3D12Fence*, std::uint64_t) noexcept -> HRESULT {
+            auto& context = *static_cast<OutputAdmissionContext*>(opaque);
+            context.result = wait_for_presenter_capacity(context.session, 1);
+            return XR_SUCCEEDED(context.result) ? S_OK : E_ABORT;
+        };
+    }
+    bool independent_pair_outputs = false;
     if (use_continuous_presenter) {
-        const XrResult capacity_result = wait_for_presenter_capacity(state, 1);
+        independent_pair_outputs = !pipelined_presenter_mode;
+        for (const auto& mapping : resource_mappings.mappings) {
+            const auto source = find_swapchain(mapping.application_swapchain);
+            if (!source) { independent_pair_outputs = false; break; }
+            std::scoped_lock source_lock(source->mutex);
+            if (!source->frame_generation ||
+                source->frame_generation->synthetic_alternate.handle == XR_NULL_HANDLE) {
+                independent_pair_outputs = false;
+                break;
+            }
+        }
+        // With both outputs alternating, the preceding pair may remain queued.
+        // FIFO capacity <=2 proves the pair two frames back has fully retired,
+        // so this frame's slot cannot still be named by a pending submission.
+        const XrResult capacity_result = wait_for_presenter_capacity(
+            state, (independent_pair_outputs || early_optical_flow) ? 2 : 1);
         if (XR_FAILED(capacity_result)) {
             return capacity_result;
         }
@@ -5002,7 +5222,14 @@ XrResult layer_end_frame_impl(
         std::span<const ProjectionResourceMapping>(
             resource_mappings.mappings.data(),
             resource_mappings.mappings.size()),
-        metadata_pairable);
+        metadata_pairable, output_admission);
+    if (XR_FAILED(admission_context.result)) return admission_context.result;
+    if (use_continuous_presenter && (independent_pair_outputs || early_optical_flow)) {
+        // Preserve the original handoff bound/latency. Only preparation moved
+        // ahead of this wait; do not let another whole pair accumulate.
+        const XrResult capacity_result = wait_for_presenter_capacity(state, 1);
+        if (XR_FAILED(capacity_result)) return capacity_result;
+    }
     // Acquire, synthesis and release all ran without the content lock, so the
     // presenter kept submitting throughout. Hold it only across the handoff.
     if (use_continuous_presenter) {

@@ -53,6 +53,18 @@ enum class BridgeFlightOperation : std::uint32_t {
     presenter_pace,
     synthesis_frame_start_wait,
     embedded_configuration,
+    fidelity_input,
+    fidelity_motion,
+    fidelity_present,
+    nvidia_queue_delay,
+    dlss_guide_status,
+    synthesis_admission,
+    history_capture_skipped,
+    presenter_capacity_wait,
+    presenter_completion_wait,
+    synthesis_overlap_policy,
+    scheduling_experiment,
+    nvidia_output_admission,
 };
 
 struct BridgeFlightToken {

@@ -27,6 +27,7 @@
 #include <new>
 #include <utility>
 #include <vector>
+#include "fidelity_capture.hpp"
 
 namespace xrfg {
 namespace {
@@ -655,6 +656,9 @@ struct D3D12FrameSynthesizer::Impl {
         UINT timing_query_base{};
         bool timing_pending{};
         bool timing_cached{};
+        std::uint64_t submission_gpu_clock{};
+        bool submission_clock_valid{};
+        std::vector<FidelityReadback> fidelity_readbacks;
     };
 
     struct RollingSource {
@@ -732,6 +736,12 @@ struct D3D12FrameSynthesizer::Impl {
     std::uint32_t next_timing_slot{};
     D3D12OpticalFlowBackend backend{D3D12OpticalFlowBackend::fidelity_fx};
     D3D12NvidiaOpticalFlowOptions nvidia_options{};
+    const bool fidelity_capture_enabled = [] {
+        wchar_t value[2]{};
+        return GetEnvironmentVariableW(L"OFXR_FIDELITY_CAPTURE", value, 2) == 1 && value[0] == L'1';
+    }();
+    bool capture_key_down{};
+    unsigned capture_count{};
     bool synthesis_enabled{};
     bool completion_unknown{};
     bool ffx_context_created{};
@@ -2038,6 +2048,12 @@ struct D3D12FrameSynthesizer::Impl {
         }
 
         slot.cached_timing = slot.timing_metadata;
+        slot.cached_timing.queue_delay_valid = slot.submission_clock_valid &&
+            values[kNvidiaTimestampPackBegin] >= slot.submission_gpu_clock;
+        if (slot.cached_timing.queue_delay_valid) {
+            slot.cached_timing.queue_delay_microseconds = timestamp_microseconds(
+                slot.submission_gpu_clock, values[kNvidiaTimestampPackBegin]);
+        }
         slot.cached_timing.pack_microseconds = timestamp_microseconds(
             values[kNvidiaTimestampPackBegin],
             values[kNvidiaTimestampPackEnd]);
@@ -2237,6 +2253,7 @@ struct D3D12FrameSynthesizer::Impl {
             const HRESULT status =
                 fence_status(fence.Get(), work_slots[index].fence_value);
             if (status == S_OK) {
+                finish_fidelity_capture(work_slots[index].fidelity_readbacks);
                 const HRESULT timing_result =
                     harvest_nvidia_gpu_timing(work_slots[index]);
                 if (FAILED(timing_result)) {
@@ -3551,7 +3568,8 @@ struct D3D12FrameSynthesizer::Impl {
     [[nodiscard]] HRESULT execute_nvidia_and_signal(
         WorkSlot& slot,
         RollingSource* newly_acquired,
-        std::uint64_t* output_fence_value) noexcept {
+        std::uint64_t* output_fence_value,
+        D3D12OutputAdmission output_admission) noexcept {
         if (newly_acquired == nullptr || output_fence_value == nullptr ||
             slot.synthesis_command_list == nullptr ||
             next_fence_value == 0 ||
@@ -3581,6 +3599,14 @@ struct D3D12FrameSynthesizer::Impl {
             return result;
         }
 
+        // Calibrate immediately before submission: distinguish queued work ahead
+        // of this pair from the GPU execution interval reported by its timestamps.
+        slot.submission_clock_valid = false;
+        if (nvidia_gpu_timing_enabled) {
+            std::uint64_t cpu_clock{};
+            slot.submission_clock_valid = SUCCEEDED(queue->GetClockCalibration(
+                &slot.submission_gpu_clock, &cpu_clock));
+        }
         ID3D12CommandList* pack_lists[] = {slot.command_list.Get()};
         queue->ExecuteCommandLists(1, pack_lists);
         completion_unknown = true;
@@ -3690,6 +3716,38 @@ struct D3D12FrameSynthesizer::Impl {
             synthesis_enabled = false;
             untracked_source = std::move(*newly_acquired);
             return result;
+        }
+        if (output_admission.wait != nullptr) {
+            auto& flight = bridge_flight_logger();
+            const auto token = flight.begin(BridgeFlightOperation::nvidia_output_admission,
+                newly_acquired->ticket.serial, pack_ready_value, last_nvidia_fence_value);
+            const HRESULT admission = output_admission.wait(output_admission.context,
+                nvidia_fence.Get(), last_nvidia_fence_value);
+            flight.end(token, BridgeFlightOperation::nvidia_output_admission, admission,
+                newly_acquired->ticket.serial, pack_ready_value, last_nvidia_fence_value);
+            if (FAILED(admission)) {
+                // Internal work was submitted, so cancellation cannot simply
+                // release either input lease. Fence the queued OFA wait, then
+                // retire the new lease and extend the retained source lifetime.
+                const auto cancelled_value = next_fence_value++;
+                result = queue->Signal(fence.Get(), cancelled_value);
+                if (SUCCEEDED(result)) {
+                    slot.fence_value = cancelled_value;
+                    last_submitted_fence_value = cancelled_value;
+                    previous.last_use_fence_value = cancelled_value;
+                    completion_unknown = false;
+                    result = history->retire_consumer(newly_acquired->lease,
+                        fence.Get(), cancelled_value);
+                }
+                if (FAILED(result)) {
+                    synthesis_enabled = false;
+                    untracked_source = std::move(*newly_acquired);
+                    newly_acquired->clear();
+                    return result;
+                }
+                newly_acquired->clear();
+                return admission;
+            }
         }
         ID3D12CommandList* synthesis_lists[] = {
             slot.synthesis_command_list.Get()};
@@ -3816,7 +3874,8 @@ struct D3D12FrameSynthesizer::Impl {
         std::uint32_t current_destination_index,
         D3D12FrameSynthesisTicket* output_ticket,
         const std::optional<OverlayPlacement>& debug_marker,
-        std::shared_ptr<const DlssMotionVectorSet> motion_vectors) noexcept {
+        std::shared_ptr<const DlssMotionVectorSet> motion_vectors,
+        D3D12OutputAdmission output_admission) noexcept {
         if (output_ticket == nullptr) {
             return E_POINTER;
         }
@@ -3898,6 +3957,14 @@ struct D3D12FrameSynthesizer::Impl {
             synthetic_destinations[synthetic_destination_index]);
         if (FAILED(result)) {
             return result;
+        }
+        // Other backends, reused frames and guide-assisted submissions have no
+        // separate internal-only phase; retain admission before their work.
+        if (output_admission.wait != nullptr &&
+            (backend != D3D12OpticalFlowBackend::nvidia || repeated_capture || motion_vectors)) {
+            result = output_admission.wait(output_admission.context, nullptr, 0);
+            if (FAILED(result)) return result;
+            output_admission = {};
         }
         std::uint32_t work_slot_index = 0;
         result = acquire_work_slot(&work_slot_index);
@@ -4014,6 +4081,70 @@ struct D3D12FrameSynthesizer::Impl {
             cancel_next();
             return result;
         }
+        // Explicit opt-in and key edge: at most four diagnostic pairs per synthesizer.
+        const bool enabled = fidelity_capture_enabled && bridge_flight_logger().enabled();
+        const bool down = enabled && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        if (down && !capture_key_down && capture_count < 4) {
+            ++capture_count;
+            try {
+                const auto folder = bridge_flight_logger().log_path().parent_path() /
+                    (bridge_flight_logger().log_path().stem().wstring() + L"-captures") /
+                    (std::to_wstring(reinterpret_cast<std::uintptr_t>(this)) + L"-" +
+                     std::to_wstring(previous.ticket.serial) + L"-" + std::to_wstring(current.serial));
+                auto* commands = backend == D3D12OpticalFlowBackend::nvidia && !used_game_motion
+                    ? slot.synthesis_command_list.Get() : slot.command_list.Get();
+                slot.fidelity_readbacks.reserve(8);
+                record_fidelity_texture(device.Get(), commands, previous.resource.Get(),
+                    D3D12_RESOURCE_STATE_COMMON, folder / L"previous.raw", slot.fidelity_readbacks);
+                record_fidelity_texture(device.Get(), commands, next.resource.Get(),
+                    D3D12_RESOURCE_STATE_COMMON, folder / L"current.raw", slot.fidelity_readbacks);
+                record_fidelity_texture(device.Get(), commands,
+                    synthetic_destinations[synthetic_destination_index].resource.Get(), release_state,
+                    folder / L"synthetic.raw", slot.fidelity_readbacks);
+                if (next.motion_vectors) {
+                    for (unsigned eye = 0; eye < next.motion_vectors->eye_count && eye < 2; ++eye) {
+                        const auto& mv = next.motion_vectors->eyes[eye];
+                        if (!mv) continue;
+                        record_fidelity_texture(device.Get(), commands, mv->motion_vectors.Get(),
+                            mv->resource_state, folder / (L"motion-" + std::to_wstring(eye) + L".raw"), slot.fidelity_readbacks);
+                        record_fidelity_texture(device.Get(), commands, mv->depth.Get(),
+                            mv->depth_resource_state, folder / (L"depth-" + std::to_wstring(eye) + L".raw"), slot.fidelity_readbacks);
+                    }
+                }
+                if (!slot.fidelity_readbacks.empty()) {
+                    std::ostringstream notes;
+                    notes.precision(9);
+                    notes << "previous_serial=" << previous.ticket.serial << " current_serial=" << current.serial
+                          << " source_index=" << current.source_index << " game_motion=" << used_game_motion << '\n';
+                    const auto write_views = [&notes](const char* name, const RollingSource& source) {
+                        for (unsigned i = 0; i < source.view_count; ++i) {
+                            const auto& v = source.views[i];
+                            notes << name << " eye=" << i << " slice=" << v.array_slice
+                                  << " rect=" << v.image_rect.offset_x << ',' << v.image_rect.offset_y << ','
+                                  << v.image_rect.width << ',' << v.image_rect.height
+                                  << " orientation=" << v.pose.orientation.x << ',' << v.pose.orientation.y << ','
+                                  << v.pose.orientation.z << ',' << v.pose.orientation.w
+                                  << " position=" << v.pose.position.x << ',' << v.pose.position.y << ',' << v.pose.position.z
+                                  << " fov=" << v.fov.angle_left << ',' << v.fov.angle_right << ','
+                                  << v.fov.angle_up << ',' << v.fov.angle_down << '\n';
+                        }
+                        if (source.motion_vectors) for (unsigned i = 0; i < source.motion_vectors->eye_count && i < 2; ++i) {
+                            const auto& mv = source.motion_vectors->eyes[i];
+                            if (!mv) continue;
+                            notes << name << " motion_eye=" << i << " stream=" << mv->stream
+                                  << " epoch=" << mv->epoch << " serial=" << mv->serial
+                                  << " previous=" << mv->previous_serial << " publication=" << mv->publication
+                                  << " jitter=" << mv->jitter_x << ',' << mv->jitter_y
+                                  << " scale=" << mv->scale_x << ',' << mv->scale_y
+                                  << " reset=" << mv->reset << " depth=" << (mv->depth != nullptr) << '\n';
+                        }
+                    };
+                    write_views("previous", previous); write_views("current", next);
+                    slot.fidelity_readbacks.front().pair_metadata = notes.str();
+                }
+            } catch (...) { /* Preserve queued readbacks until the slot fence completes. */ }
+        }
+        capture_key_down = down;
         result = queue->Wait(
             previous.producer_fence.Get(),
             previous.ticket.fence_value);
@@ -4029,7 +4160,7 @@ struct D3D12FrameSynthesizer::Impl {
 
         std::uint64_t fence_value = 0;
         result = backend == D3D12OpticalFlowBackend::nvidia && !used_game_motion
-                     ? execute_nvidia_and_signal(slot, &next, &fence_value)
+                     ? execute_nvidia_and_signal(slot, &next, &fence_value, output_admission)
                      : execute_and_signal(slot, &next, &fence_value);
         if (FAILED(result)) {
             if (next.active()) {
@@ -4227,7 +4358,8 @@ HRESULT D3D12FrameSynthesizer::submit_pair(
     std::uint32_t current_destination_index,
     D3D12FrameSynthesisTicket* ticket,
     std::optional<OverlayPlacement> debug_marker,
-    std::shared_ptr<const DlssMotionVectorSet> motion_vectors) noexcept {
+    std::shared_ptr<const DlssMotionVectorSet> motion_vectors,
+    D3D12OutputAdmission output_admission) noexcept {
     try {
         std::scoped_lock lock(mutex_);
         if (impl_ == nullptr) {
@@ -4244,7 +4376,8 @@ HRESULT D3D12FrameSynthesizer::submit_pair(
             current_destination_index,
             ticket,
             debug_marker,
-            std::move(motion_vectors));
+            std::move(motion_vectors),
+            output_admission);
     } catch (...) {
         if (ticket != nullptr) {
             *ticket = {};

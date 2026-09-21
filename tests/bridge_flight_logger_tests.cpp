@@ -8,6 +8,10 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
+#include <set>
+#include <sstream>
 
 namespace fs = std::filesystem;
 
@@ -178,6 +182,66 @@ int main(int argc, char** argv) {
                     "op=nvidia_gpu_total result=0 dur_us=0 a=404 b=1010 c=77") !=
                     std::string::npos,
             "bridge log is missing V049 NVIDIA GPU timing fields");
+
+        // Cross several segment boundaries with simultaneous writers. Every
+        // event must survive exactly once, including the startup record.
+        const auto segmented_dir = temporary.path / "segmented";
+        fs::create_directories(segmented_dir);
+        write(segmented_dir / "ofxr_bridge.ini",
+            "[diagnostics]\nlogging_enabled=1\nmax_file_mb=1\n");
+        xrfg::BridgeFlightLogger segmented;
+        segmented.initialize(segmented_dir);
+        const auto first_path = segmented.log_path();
+        std::vector<std::thread> writers;
+        for (unsigned worker = 0; worker < 4; ++worker) {
+            writers.emplace_back([&, worker] {
+                for (unsigned index = 0; index < 10000; ++index) {
+                    segmented.event(xrfg::BridgeFlightOperation::synthesis_pair,
+                        0, worker, index, 0);
+                }
+            });
+        }
+        for (auto& writer : writers) writer.join();
+        segmented.shutdown();
+        std::set<std::uint64_t> sequences;
+        unsigned files = 0;
+        for (const auto& item : fs::directory_iterator(segmented_dir)) {
+            if (item.path().extension() != ".log") continue;
+            ++files;
+            require(fs::file_size(item.path()) <= 1024 * 1024,
+                "segment exceeded configured limit");
+            std::istringstream lines(read(item.path()));
+            std::string line;
+            while (std::getline(lines, line)) {
+                require(line.starts_with("seq="), "incomplete recorder line");
+                require(sequences.insert(std::stoull(line.substr(4))).second,
+                    "duplicate event across segments");
+            }
+        }
+        require(files > 2 && sequences.size() == 40002 &&
+                *sequences.begin() == 1 && *sequences.rbegin() == 40002,
+            "rotation lost events");
+        require(read(first_path).starts_with("seq=1 "), "startup was overwritten");
+
+        // A collision must preserve both the old segment and future events.
+        const auto failure_dir = temporary.path / "rotation-failure";
+        fs::create_directories(failure_dir);
+        write(failure_dir / "ofxr_bridge.ini",
+            "[diagnostics]\nlogging_enabled=1\nmax_file_mb=1\n");
+        xrfg::BridgeFlightLogger failure;
+        failure.initialize(failure_dir);
+        const auto failure_path = failure.log_path();
+        auto collision = failure_path;
+        collision.replace_extension(L".part1.log");
+        write(collision, "preserve existing file");
+        for (unsigned index = 0; index < 20000; ++index)
+            failure.event(xrfg::BridgeFlightOperation::synthesis_pair, 0, index);
+        failure.shutdown();
+        const auto retained = read(failure_path);
+        require(retained.starts_with("seq=1 ") &&
+                retained.find("seq=20002 ") != std::string::npos &&
+                read(collision) == "preserve existing file",
+            "failed rotation discarded data");
 
         std::cout << "Bridge flight logger tests passed.\n";
         return 0;

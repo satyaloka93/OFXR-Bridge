@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -54,6 +55,12 @@ XrSwapchain g_synthetic_swapchain_right = fake_handle<XrSwapchain>(0x308);
 // creates two per application swapchain and this runtime hands out both.
 XrSwapchain g_current_swapchain_b = fake_handle<XrSwapchain>(0x309);
 XrSwapchain g_current_swapchain_right_b = fake_handle<XrSwapchain>(0x30a);
+XrSwapchain g_synthetic_swapchain_b = fake_handle<XrSwapchain>(0x30b);
+std::array<std::atomic<unsigned>, 2> g_synthetic_versions{}, g_current_versions{};
+std::atomic<unsigned> g_last_current_slot{};
+bool g_reject_alternate{};
+std::atomic<unsigned> g_last_synthetic_slot{};
+std::atomic<bool> g_hold_presenter_wait{}, g_presenter_wait_held{};
 XrSpace g_space = fake_handle<XrSpace>(0x404);
 std::atomic<XrSpace> g_valid_composition_space{g_space};
 std::atomic<bool> g_delay_composition_validation{false};
@@ -156,6 +163,7 @@ std::array<ComPtr<ID3D12Resource>, 3> g_application_swapchain_images;
 std::array<ComPtr<ID3D12Resource>, 3> g_current_swapchain_images;
 std::array<ComPtr<ID3D12Resource>, 3> g_current_swapchain_b_images;
 std::array<ComPtr<ID3D12Resource>, 3> g_synthetic_swapchain_images;
+std::array<ComPtr<ID3D12Resource>, 3> g_synthetic_swapchain_b_images;
 std::array<ComPtr<ID3D12Resource>, 3> g_application_swapchain_right_images;
 std::array<ComPtr<ID3D12Resource>, 3> g_current_swapchain_right_images;
 std::array<ComPtr<ID3D12Resource>, 3> g_current_swapchain_right_b_images;
@@ -174,7 +182,7 @@ std::array<ComPtr<ID3D12Resource>, 3> g_synthetic_swapchain_right_images;
 }
 
 [[nodiscard]] bool is_synthetic_swapchain(XrSwapchain swapchain) {
-    return swapchain == g_synthetic_swapchain ||
+    return swapchain == g_synthetic_swapchain || swapchain == g_synthetic_swapchain_b ||
            swapchain == g_synthetic_swapchain_right;
 }
 
@@ -254,6 +262,10 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_wait_frame(
     XrFrameState* frame_state) {
     if (frame_state == nullptr) {
         return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (GetCurrentThreadId() != g_test_application_thread_id && g_hold_presenter_wait) {
+        g_presenter_wait_held = true;
+        while (g_hold_presenter_wait) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     const std::uint32_t wait_call =
         g_wait_frame_calls.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -602,6 +614,9 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_create_swapchain(
             g_current_create_info_valid.load(std::memory_order_acquire) && valid,
             std::memory_order_release);
         *swapchain = g_current_swapchain_b;
+    } else if (call == 4 && g_steamvr_runtime_mode && !g_d3d11_interop_mode) {
+        if (g_reject_alternate) return XR_ERROR_OUT_OF_MEMORY;
+        *swapchain = g_synthetic_swapchain_b;
     } else if (call == 3) {
         const std::uint32_t expected_width = g_double_wide_mode ? 8U : 4U;
         const std::uint32_t expected_array_size = g_double_wide_mode ? 1U : 2U;
@@ -685,6 +700,8 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_enumerate_swapchain_images(
             selected_images = &g_current_swapchain_b_images;
         } else if (swapchain == g_synthetic_swapchain) {
             selected_images = &g_synthetic_swapchain_images;
+        } else if (swapchain == g_synthetic_swapchain_b) {
+            selected_images = &g_synthetic_swapchain_b_images;
         } else if (swapchain == g_application_swapchain_right) {
             selected_images = &g_application_swapchain_right_images;
         } else if (swapchain == g_current_swapchain_right) {
@@ -744,6 +761,16 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_release_swapchain_image(
     const XrSwapchainImageReleaseInfo*) {
     if (is_current_swapchain(swapchain) || is_synthetic_swapchain(swapchain)) {
         const bool synthetic = is_synthetic_swapchain(swapchain);
+        if (!synthetic) {
+            const unsigned slot = swapchain == g_current_swapchain_b ? 1 : 0;
+            ++g_current_versions[slot];
+            g_last_current_slot = slot;
+        }
+        if (synthetic) {
+            const unsigned slot = swapchain == g_synthetic_swapchain_b ? 1 : 0;
+            ++g_synthetic_versions[slot];
+            g_last_synthetic_slot = slot;
+        }
         (synthetic ? g_synthetic_release_calls : g_current_release_calls)
             .fetch_add(1, std::memory_order_relaxed);
         if (!g_log_path.empty()) {
@@ -875,6 +902,7 @@ template <typename Function>
              &g_current_swapchain_images,
              &g_current_swapchain_b_images,
              &g_synthetic_swapchain_images,
+             &g_synthetic_swapchain_b_images,
              &g_application_swapchain_right_images,
              &g_current_swapchain_right_images,
              &g_current_swapchain_right_b_images,
@@ -1022,7 +1050,17 @@ int main(int argc, char** argv) {
         argc == 4 && std::strcmp(argv[3], "d3d11-double-wide") == 0;
     g_destroy_pending_space =
         argc == 4 && std::strcmp(argv[3], "steamvr-destroy-space") == 0;
-    g_steamvr_presenter_mode = g_destroy_pending_space ||
+    const bool prepare_disabled = argc == 4 && std::strcmp(argv[3], "steamvr-prepare-ahead-disabled") == 0;
+    g_reject_alternate = prepare_disabled || (argc == 4 && std::strcmp(argv[3], "steamvr-prepare-ahead-fallback") == 0);
+    const bool prepare_ahead = g_reject_alternate ||
+        (argc == 4 && std::strcmp(argv[3], "steamvr-prepare-ahead") == 0);
+    const bool forced_baseline = argc == 4 && std::strcmp(argv[3], "steamvr-force-baseline") == 0;
+    const bool forced_overlap = argc == 4 && std::strcmp(argv[3], "steamvr-force-overlap") == 0;
+    const bool overlap_test = forced_baseline || forced_overlap || (argc == 4 &&
+        (std::strcmp(argv[3], "steamvr-overlap") == 0 ||
+         std::strcmp(argv[3], "steamvr-overlap-reuse") == 0));
+    const bool overlap_reuse = argc == 4 && std::strcmp(argv[3], "steamvr-overlap-reuse") == 0;
+    g_steamvr_presenter_mode = prepare_ahead || overlap_test || g_destroy_pending_space ||
         (argc == 4 && std::strcmp(argv[3], "steamvr-presenter") == 0);
     g_steamvr_runtime_mode = g_steamvr_presenter_mode ||
         (argc == 4 && std::strcmp(argv[3], "steamvr-inline") == 0);
@@ -1043,8 +1081,9 @@ int main(int argc, char** argv) {
     g_double_wide_mode = argc == 4 &&
         (std::strcmp(argv[3], "double-wide") == 0 ||
          d3d11_double_wide_mode || g_uevr_pipelined_display_time_mode);
+    const bool selection_test = argc == 4 && std::strcmp(argv[3], "capture-selection") == 0;
     g_split_eye_mode = argc == 4 &&
-        (std::strcmp(argv[3], "split-eye") == 0 || g_cropped_subimage_mode);
+        (std::strcmp(argv[3], "split-eye") == 0 || g_cropped_subimage_mode || selection_test);
     if (argc == 4 && !g_split_eye_mode && !g_double_wide_mode &&
         !g_d3d11_interop_mode && !g_steamvr_runtime_mode &&
         !g_flight_simulator_mode && !g_uevr_pipelined_display_time_mode &&
@@ -1088,6 +1127,34 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
+    // Explicit opt-in exercises the quarantined experiment; production defaults
+    // must not consume extra runtime swapchains during application startup.
+    SetEnvironmentVariableW(L"OFXR_EXPERIMENTAL_PREPARE_AHEAD",
+        g_steamvr_runtime_mode && !prepare_disabled ? L"1" : nullptr);
+    struct SchedulingFixture {
+        std::filesystem::path path;
+        bool existed{};
+        std::string original;
+        SchedulingFixture(const char* dll, unsigned mode) {
+            path = std::filesystem::path(dll).parent_path() / "ofxr-scheduling.ini";
+            existed = std::filesystem::exists(path);
+            if (existed) {
+                std::ifstream input(path, std::ios::binary);
+                original.assign(std::istreambuf_iterator<char>(input), {});
+            }
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            output << "[scheduling]\nmode=" << mode << '\n';
+        }
+        ~SchedulingFixture() {
+            if (existed) {
+                std::ofstream output(path, std::ios::binary | std::ios::trunc);
+                output << original;
+            } else {
+                std::error_code error;
+                std::filesystem::remove(path, error);
+            }
+        }
+    } scheduling_fixture(argv[1], forced_baseline ? 1U : forced_overlap ? 2U : 0U);
     const HMODULE module = LoadLibraryA(argv[1]);
     if (module == nullptr) {
         std::cerr << "LoadLibrary failed: " << GetLastError() << '\n';
@@ -1327,6 +1394,55 @@ int main(int argc, char** argv) {
             frame_end_info.layers = layers;
             return XR_SUCCEEDED(end_frame(session, &frame_end_info));
         };
+
+        if (selection_test) {
+            g_expected_passthrough_layer = nullptr;
+            auto run = [&](bool right, bool release_images) {
+                XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
+                XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
+                XrFrameState fs{XR_TYPE_FRAME_STATE};
+                if (XR_FAILED(wait_frame(session, &wi, &fs)) ||
+                    XR_FAILED(begin_frame(session, &bi)) ||
+                    (release_images && (!capture_application_image(left_swapchain) ||
+                                        !capture_application_image(right_swapchain)))) return false;
+                for (std::uint32_t eye = 0; eye < projection_views.size(); ++eye) {
+                    const auto view = fake_submitted_view_for_time(fs.predictedDisplayTime, eye);
+                    projection_views[eye].pose = view.pose;
+                    projection_views[eye].fov = view.fov;
+                }
+                const XrCompositionLayerBaseHeader* layer = reinterpret_cast<
+                    const XrCompositionLayerBaseHeader*>(&eye_projections[right ? 1 : 0]);
+                XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
+                ei.displayTime = fs.predictedDisplayTime;
+                ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                ei.layerCount = 1;
+                ei.layers = &layer;
+                return XR_SUCCEEDED(end_frame(session, &ei)) && wait_for_queue_idle();
+            };
+            auto last_target = [&] {
+                std::scoped_lock lock(g_end_records_mutex);
+                return g_end_records.empty() ? SubmittedTarget::none : g_end_records.back().target;
+            };
+            // Startup captures both. The second frame must skip right and clear
+            // its old ticket. Switching to that released image must pass through.
+            bool ok = run(false, true) && run(false, true) &&
+                      run(true, false) && last_target() == SubmittedTarget::original;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            // Still no new release: the old startup capture must remain unusable.
+            ok = ok && run(true, false) && last_target() == SubmittedTarget::original;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            ok = ok && run(true, true) && last_target() == SubmittedTarget::current;
+            ok = ok && run(true, true) && last_target() == SubmittedTarget::current;
+            ok = XR_SUCCEEDED(end_session(session)) && ok;
+            ok = XR_SUCCEEDED(destroy_swapchain(left_swapchain)) && ok;
+            ok = XR_SUCCEEDED(destroy_swapchain(right_swapchain)) && ok;
+            ok = XR_SUCCEEDED(destroy_session(session)) && ok;
+            ok = XR_SUCCEEDED(destroy_instance(instance)) && ok;
+            FreeLibrary(module);
+            std::cout << "Selective capture source change and stale-ticket recovery: "
+                      << (ok ? "passed" : "FAILED") << '\n';
+            return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
 
         XrFrameWaitInfo frame_wait_info{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameBeginInfo frame_begin_info{XR_TYPE_FRAME_BEGIN_INFO};
@@ -1890,6 +2006,32 @@ int main(int argc, char** argv) {
                 submit_frame(application_frames[index].predictedDisplayTime);
         }
 
+        std::atomic<bool> prepare_watchdog_fired{};
+        std::jthread prepare_watchdog;
+        if (prepare_ahead) {
+            prepare_watchdog = std::jthread([&](std::stop_token stop) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (!stop.stop_requested()) {
+                    prepare_watchdog_fired = true;
+                    g_hold_presenter_wait = false;
+                }
+            });
+        }
+        ComPtr<ID3D12Fence> overlap_gate;
+        auto arm_overlap_gate = [&] {
+            if (prepare_ahead) {
+                // Let the promotion seed drain before holding the next runtime
+                // wait; this test targets preparation of the pair AFTER frame 6.
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                g_hold_presenter_wait = true;
+            }
+            if (!overlap_test) return true;
+            return SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                       IID_PPV_ARGS(overlap_gate.GetAddressOf()))) &&
+                   SUCCEEDED(g_queue->Wait(overlap_gate.Get(), 1));
+        };
         // frameWaitInfo and frameBeginInfo are optional in the registry, and the
         // presenter answers both calls itself rather than forwarding them, so
         // this frame passes null to keep that path accepting what a runtime
@@ -1904,8 +2046,85 @@ int main(int argc, char** argv) {
             application_frames[5].predictedDisplayTime >
                 application_frames[4].predictedDisplayTime &&
             XR_SUCCEEDED(begin_frame(session, nullptr)) &&
-            capture_fresh_application_image() &&
+            capture_fresh_application_image() && arm_overlap_gate() &&
             submit_frame(application_frames[5].predictedDisplayTime);
+
+        if (prepare_ahead) {
+            prepare_watchdog.request_stop();
+            prepare_watchdog.join();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!g_presenter_wait_held && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const auto held_slot = g_last_synthetic_slot.load();
+            const auto held_version = g_synthetic_versions[held_slot].load();
+            const auto current_slot = g_last_current_slot.load();
+            const auto current_version = g_current_versions[current_slot].load();
+            const auto releases = g_synthetic_release_calls.load();
+            bool prepared_before_unblock = false, held_unchanged = false;
+            std::thread unblock([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+                prepared_before_unblock = g_synthetic_release_calls.load() > releases;
+                held_unchanged = g_synthetic_versions[held_slot].load() == held_version &&
+                    g_current_versions[current_slot].load() == current_version;
+                g_hold_presenter_wait = false;
+            });
+            const bool submitted = XR_SUCCEEDED(wait_frame(session, nullptr, &application_frames[6])) &&
+                XR_SUCCEEDED(begin_frame(session, nullptr)) && capture_fresh_application_image() &&
+                submit_frame(application_frames[6].predictedDisplayTime);
+            unblock.join();
+            const bool default_allocation = !prepare_disabled ||
+                g_create_swapchain_calls.load() == 4;
+            const bool valid = default_allocation && !prepare_watchdog_fired && frame_sequence_succeeded && submitted && g_presenter_wait_held &&
+                prepared_before_unblock == !g_reject_alternate && held_unchanged && wait_for_queue_idle();
+            const bool teardown = XR_SUCCEEDED(end_session(session)) &&
+                XR_SUCCEEDED(destroy_swapchain(swapchain)) &&
+                XR_SUCCEEDED(destroy_session(session)) && XR_SUCCEEDED(destroy_instance(instance));
+            FreeLibrary(module);
+            std::cout << "Prepare ahead=" << prepared_before_unblock
+                      << " held synthetic unchanged=" << held_unchanged << '\n';
+            return valid && teardown ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
+
+        if (overlap_test) {
+            // Release a deliberately blocked synthesis after 400 ms. Wait/begin
+            // must admit CPU work first; release (or a reused-image end) must
+            // still wait for completion before allowing another transaction.
+            if (!overlap_gate) return EXIT_FAILURE;
+            std::thread unblock([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+                overlap_gate->Signal(1);
+            });
+            const auto started = std::chrono::steady_clock::now();
+            const auto wait_result = wait_frame(session, nullptr, &application_frames[6]);
+            const auto admission = std::chrono::steady_clock::now() - started;
+            const auto begin_result = begin_frame(session, nullptr);
+            bool captured = true;
+            const auto release_started = std::chrono::steady_clock::now();
+            if (!overlap_reuse) {
+                captured = XR_SUCCEEDED(acquire_image(swapchain, &acquire_info, &acquired_index)) &&
+                    XR_SUCCEEDED(wait_image(swapchain, &image_wait_info)) &&
+                    XR_SUCCEEDED(release_image(swapchain, &release_info));
+            }
+            const bool submitted = submit_frame(application_frames[6].predictedDisplayTime);
+            const auto protected_elapsed = std::chrono::steady_clock::now() - release_started;
+            unblock.join();
+            const bool valid = frame_sequence_succeeded && XR_SUCCEEDED(wait_result) &&
+                XR_SUCCEEDED(begin_result) && captured && submitted &&
+                (forced_baseline
+                    ? admission >= std::chrono::milliseconds(150) &&
+                      protected_elapsed < std::chrono::milliseconds(150)
+                    : admission < std::chrono::milliseconds(150) &&
+                      protected_elapsed >= std::chrono::milliseconds(150)) && wait_for_queue_idle();
+            const bool teardown = XR_SUCCEEDED(end_session(session)) &&
+                XR_SUCCEEDED(destroy_swapchain(swapchain)) &&
+                XR_SUCCEEDED(destroy_session(session)) && XR_SUCCEEDED(destroy_instance(instance));
+            FreeLibrary(module);
+            std::cout << "Overlap " << (overlap_reuse ? "reuse" : "capture")
+                      << " admission_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(admission).count()
+                      << " protected_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(protected_elapsed).count()
+                      << '\n';
+            return valid && teardown ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
 
         if (g_destroy_pending_space) {
             frame_sequence_succeeded = frame_sequence_succeeded && destroy_space &&
@@ -2331,8 +2550,8 @@ int main(int argc, char** argv) {
         g_end_frame_calls.load(std::memory_order_relaxed) == 18 &&
         g_locate_views_calls.load(std::memory_order_relaxed) == 10 &&
         // One application swapchain, two current slots and one synthetic.
-        g_create_swapchain_calls.load(std::memory_order_relaxed) == 4 &&
-        g_destroy_swapchain_calls.load(std::memory_order_relaxed) == 4 &&
+        g_create_swapchain_calls.load(std::memory_order_relaxed) == (g_steamvr_runtime_mode && !g_d3d11_interop_mode ? 5U : 4U) &&
+        g_destroy_swapchain_calls.load(std::memory_order_relaxed) == (g_steamvr_runtime_mode && !g_d3d11_interop_mode ? 5U : 4U) &&
         g_application_release_calls.load(std::memory_order_relaxed) == 14 &&
         g_current_acquire_calls.load(std::memory_order_relaxed) == 10 &&
         g_current_wait_calls.load(std::memory_order_relaxed) == 10 &&

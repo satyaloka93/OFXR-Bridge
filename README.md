@@ -1,5 +1,11 @@
 # OFXR Bridge
 
+This fork adds shutdown-lifetime fixes, adaptive application-frame overlap,
+selective history capture and earlier NVIDIA optical-flow submission to the
+upstream v0.2.1 / V116 base. See [fork status and evidence](docs/FORK_STATUS.md)
+and the [OKF knowledge bundle](.okf/index.md). Internal build identity remains
+V116; this is not a new upstream release.
+
 OFXR Bridge is an experimental OpenXR API layer that inserts an optical-flow
 generated frame between two rendered frames.
 
