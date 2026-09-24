@@ -53,3 +53,44 @@ ofxr/
 ```
 
 Do not distribute PDBs, static libraries, test executables or the NVIDIA SDK.
+
+## Building from WSL
+
+Use the Windows CMake executable and Visual Studio toolchain from WSL Bash.
+This produces Windows binaries; Linux CMake/GCC is not the Windows release
+toolchain. Install the Windows prerequisites above and prepare FidelityFX using
+the same Windows tools. Pass Windows paths to Windows executables.
+
+For this checkout on drive F (adjust paths for your own checkout):
+
+```bash
+'/mnt/c/Program Files/CMake/bin/cmake.exe' \
+  -S F:/ai/GITHUB/OFXR-Bridge -B F:/ai/GITHUB/OFXR-Bridge/build \
+  -G 'Visual Studio 17 2022' -A x64
+'/mnt/c/Program Files/CMake/bin/cmake.exe' \
+  --build F:/ai/GITHUB/OFXR-Bridge/build --config Release --parallel 6
+'/mnt/c/Program Files/CMake/bin/ctest.exe' \
+  --test-dir F:/ai/GITHUB/OFXR-Bridge/build -C Release --output-on-failure
+```
+
+For NVIDIA hardware verification, run from Windows PowerShell after building:
+
+```powershell
+$env:XRFG_TEST_NVIDIA = '1'
+& .\build\Release\xrfg_d3d12_history_tests.exe
+Remove-Item Env:XRFG_TEST_NVIDIA
+```
+
+## Packaging the fork
+
+After building/testing a clean committed checkout, run Python 3 (WSL or Windows):
+
+```bash
+python3 scripts/package-release.py --version 0.2.1-perf.1
+```
+
+The script packages only the tray, layer, default configuration, instructions,
+diagnostic scripts and licenses into `build/packages`. It records the source
+commit and hashes, excludes debug/test binaries and raw logs, and checks that
+the tray's layer copy matches the main build DLL. Build/test before packaging;
+packaging alone does not prove source/binary correspondence.
