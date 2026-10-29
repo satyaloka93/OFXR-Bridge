@@ -282,6 +282,28 @@ bool read_deep_pipeline(
     }
 }
 
+bool read_independent_synthesis_queues(
+    const std::filesystem::path& module_directory) noexcept {
+    try {
+        if (module_directory.empty()) return false;
+        return ini_file::read_int(module_directory / L"ofxr_bridge.ini",
+            L"ofxr", L"independent_synthesis_queues", 0) != 0;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool read_panel_frame_generation(
+    const std::filesystem::path& module_directory) noexcept {
+    try {
+        if (module_directory.empty()) return true;
+        return ini_file::read_int(module_directory / L"ofxr_bridge.ini",
+            L"ofxr", L"panel_frame_generation", 1) != 0;
+    } catch (...) {
+        return true;
+    }
+}
+
 bool read_triple_frame_gen(
     const std::filesystem::path& module_directory) noexcept {
     try {

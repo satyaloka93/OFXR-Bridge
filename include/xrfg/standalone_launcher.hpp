@@ -40,6 +40,8 @@ struct LauncherSettings {
     bool nvidia_bidirectional{};
     // "Prefer FPS over latency": the layer's deeper pipeline. On by default.
     bool deep_pipeline{true};
+    bool panel_frame_generation{true};
+    bool independent_synthesis_queues{false};
     // "3X Frame Gen": two synthetic frames per application frame. Off by
     // default.
     bool triple_frame_gen{};

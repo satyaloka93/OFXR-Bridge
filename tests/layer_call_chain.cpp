@@ -133,6 +133,7 @@ bool g_split_eye_mode = false;
 // V509: the split-eye runtime's second swapchain carries a HUD quad, and
 // the projection's two views share the first.
 bool g_hud_panel_mode = false;
+bool g_panel_frame_generation = true;
 // Whether the layer under test runs the deeper pipeline. Read from the same
 // ofxr_bridge.ini the layer reads, beside the layer DLL, so the fake runtime
 // expects the ring sizes the layer will actually ask for: one synthetic slot
@@ -739,6 +740,11 @@ XRAPI_ATTR XrResult XRAPI_CALL fake_begin_frame(XrSession, const XrFrameBeginInf
 XRAPI_ATTR XrResult XRAPI_CALL fake_end_frame(
     XrSession,
     const XrFrameEndInfo* end_info) {
+    if (g_steamvr_presenter_mode && GetCurrentThreadId() != g_test_application_thread_id &&
+        GetThreadPriority(GetCurrentThread()) != THREAD_PRIORITY_HIGHEST) {
+        std::cerr << "Presenter runtime call did not run at requested priority\n";
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
     g_end_frame_calls.fetch_add(1, std::memory_order_relaxed);
     record_frame_call_thread();
     {
@@ -2319,6 +2325,8 @@ int main(int argc, char** argv) {
     {
         std::filesystem::path ini = std::filesystem::path(argv[1]).parent_path() /
             L"ofxr_bridge.ini";
+        g_panel_frame_generation = GetPrivateProfileIntW(
+            L"ofxr", L"panel_frame_generation", 1, ini.wstring().c_str()) != 0;
         // Same default as the layer: on unless the ini says 0.
         g_deep_pipeline = GetPrivateProfileIntW(
             L"ofxr", L"deep_pipeline", 1, ini.wstring().c_str()) != 0;
@@ -2637,6 +2645,7 @@ int main(int argc, char** argv) {
             reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud),
         };
         auto submit_frame = [&](XrTime display_time) {
+            hud.pose.position.x = static_cast<float>(display_time) / 1000.0F;
             XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
             locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
             locate_info.displayTime = display_time;
@@ -2688,9 +2697,11 @@ int main(int argc, char** argv) {
             end_records = g_end_records;
         }
         const auto hud_current = [](XrSwapchain handle) {
+            if (!g_panel_frame_generation) return handle == g_application_swapchain_right;
             return handle == g_current_swapchain_right || handle == g_current_swapchain_right_b;
         };
         const auto hud_synthetic = [](XrSwapchain handle) {
+            if (!g_panel_frame_generation) return handle == g_application_swapchain_right;
             return handle == g_synthetic_swapchain_right ||
                 handle == g_synthetic_swapchain_right_b;
         };
@@ -2708,6 +2719,9 @@ int main(int argc, char** argv) {
             record_ok(1, SubmittedTarget::current, hud_current) &&
             record_ok(2, SubmittedTarget::synthetic, hud_synthetic) &&
             record_ok(3, SubmittedTarget::current, hud_current) &&
+            std::abs(end_records[1].quad_x - .2F) < .001F &&
+            std::abs(end_records[2].quad_x - .25F) < .001F &&
+            std::abs(end_records[3].quad_x - .3F) < .001F &&
             g_destroy_swapchain_calls.load(std::memory_order_relaxed) ==
                 g_create_swapchain_calls.load(std::memory_order_relaxed);
         if (!valid) {
@@ -2725,7 +2739,7 @@ int main(int argc, char** argv) {
             return EXIT_FAILURE;
         }
         std::cout << "OpenXR HUD panel fake-runtime call-chain test passed: "
-                     "the panel's own images in the generated frames\n";
+                     "panel images and interpolated pose preserved\n";
         return EXIT_SUCCESS;
     }
 

@@ -213,6 +213,12 @@ LauncherSettings parse_settings(std::string_view text) {
                 } else if (key == "deep_pipeline") {
                     settings.deep_pipeline = value == "1" ||
                         lower_ascii(value) == "true";
+                } else if (key == "independent_synthesis_queues") {
+                    settings.independent_synthesis_queues = value == "1" ||
+                        lower_ascii(value) == "true";
+                } else if (key == "panel_frame_generation") {
+                    settings.panel_frame_generation = value == "1" ||
+                        lower_ascii(value) == "true";
                 } else if (key == "triple_frame_gen") {
                     settings.triple_frame_gen = value == "1" ||
                         lower_ascii(value) == "true";
@@ -338,6 +344,8 @@ std::string serialize_settings(const LauncherSettings& settings) {
            "\r\nnvidia_bidirectional=" +
            (settings.nvidia_bidirectional ? "1" : "0") +
            "\r\ndeep_pipeline=" + (settings.deep_pipeline ? "1" : "0") +
+           "\r\nindependent_synthesis_queues=" + (settings.independent_synthesis_queues ? "1" : "0") +
+           "\r\npanel_frame_generation=" + (settings.panel_frame_generation ? "1" : "0") +
            "\r\ntriple_frame_gen=" + (settings.triple_frame_gen ? "1" : "0") +
            "\r\nhybrid=" + (settings.hybrid ? "1" : "0") +
            "\r\nhybrid_depth_search=" + (settings.hybrid_depth_search ? "1" : "0") +
@@ -583,6 +591,8 @@ std::string build_runtime_ini(
            "\r\nnvidia_bidirectional=" +
            (settings.nvidia_bidirectional ? "1" : "0") +
            "\r\ndeep_pipeline=" + (settings.deep_pipeline ? "1" : "0") +
+           "\r\nindependent_synthesis_queues=" + (settings.independent_synthesis_queues ? "1" : "0") +
+           "\r\npanel_frame_generation=" + (settings.panel_frame_generation ? "1" : "0") +
            "\r\ntriple_frame_gen=" + (settings.triple_frame_gen ? "1" : "0") +
            "\r\nhybrid=" + (settings.hybrid ? "1" : "0") +
            "\r\nhybrid_depth_search=" + (settings.hybrid_depth_search ? "1" : "0") +

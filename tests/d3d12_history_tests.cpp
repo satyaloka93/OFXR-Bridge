@@ -358,7 +358,8 @@ private:
 [[nodiscard]] ComPtr<ID3D12Resource> create_single_slice_texture(
     D3D12WarpFixture& fixture,
     UINT width,
-    UINT height) {
+    UINT height,
+    D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_RENDER_TARGET) {
     D3D12_RESOURCE_DESC description = stereo_texture_description(width, height);
     description.DepthOrArraySize = 1;
     const D3D12_HEAP_PROPERTIES properties =
@@ -369,7 +370,7 @@ private:
             &properties,
             D3D12_HEAP_FLAG_NONE,
             &description,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            initial_state,
             nullptr,
             IID_PPV_ARGS(texture.GetAddressOf())),
         "ID3D12Device::CreateCommittedResource(single-slice texture)");
@@ -6166,6 +6167,104 @@ void test_flat_panel_marker_synthesis(
     require(operation_succeeded(history->invalidate()), "flat panel history invalidate failed");
 }
 
+
+// Exercise two separate NVIDIA sessions with both pairs in flight before
+// joining the runtime queue. Compare pixels against a shared synthesis queue.
+std::array<std::vector<std::uint8_t>, 2> test_nvidia_independent_queues(
+    D3D12WarpFixture& fixture, bool independent) {
+    // Layer-owned RT targets isolate queue independence from the pre-existing
+    // COMMON-state runtime-target workaround documented in the synthesizer.
+    constexpr UINT width = 512, height = 256;
+    struct Eye {
+        ComPtr<ID3D12CommandQueue> queue;
+        std::array<ComPtr<ID3D12Resource>, 2> source, current;
+        ComPtr<ID3D12Resource> synthetic;
+        std::shared_ptr<xrfg::D3D12SwapchainHistory> history;
+        xrfg::D3D12FrameSynthesizer synth;
+        xrfg::D3D12FrameSynthesisTicket ticket{};
+    };
+    std::array<Eye, 2> eyes;
+    std::array<xrfg::D3D12ReprojectionView, 1> views{};
+    views[0].fov = {-0.785398F, 0.785398F, 0.785398F, -0.785398F};
+    views[0].image_rect = {0, 0, width, height};
+    views[0].array_slice = 0;
+    for (unsigned e = 0; e < eyes.size(); ++e) {
+        auto& eye = eyes[e];
+        if (!independent && e == 1) eye.queue = eyes[0].queue;
+        else {
+            D3D12_COMMAND_QUEUE_DESC description{};
+            description.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            description.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+            require_hresult(fixture.device()->CreateCommandQueue(&description,
+                IID_PPV_ARGS(eye.queue.GetAddressOf())), "eye queue creation");
+        }
+        for (unsigned i = 0; i < 2; ++i) {
+            eye.source[i] = create_single_slice_texture(fixture, width, height);
+            eye.current[i] = create_single_slice_texture(fixture, width, height,
+                D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto pattern = translated_motion_pattern(width, height,
+                {static_cast<int>(i * 16), -static_cast<int>(i * 16)});
+            upload_single_slice(fixture, eye.source[i].Get(), pattern[e]);
+        }
+        eye.synthetic = create_single_slice_texture(fixture, width, height,
+            D3D12_RESOURCE_STATE_RENDER_TARGET);
+        std::array<ID3D12Resource*, 2> sources{eye.source[0].Get(), eye.source[1].Get()};
+        std::array<ID3D12Resource*, 2> current{eye.current[0].Get(), eye.current[1].Get()};
+        std::array<ID3D12Resource*, 1> synthetic{eye.synthetic.Get()};
+        eye.history = std::make_shared<xrfg::D3D12SwapchainHistory>();
+        require_hresult(eye.history->initialize(fixture.device(), fixture.queue(),
+            sources, D3D12_RESOURCE_STATE_RENDER_TARGET), "eye history init");
+        xrfg::D3D12NvidiaOpticalFlowOptions options{};
+        options.preset = xrfg::D3D12NvidiaPerformancePreset::medium;
+        options.input_scale = xrfg::D3D12NvidiaInputScale::half;
+        require_hresult(eye.synth.initialize(fixture.device(), eye.queue.Get(),
+            eye.history, current, synthetic, kFormat, D3D12_RESOURCE_STATE_RENDER_TARGET,
+            xrfg::D3D12OpticalFlowBackend::nvidia, options), "eye NVIDIA init");
+        xrfg::D3D12HistoryCaptureTicket capture{};
+        require_hresult(eye.history->capture(0, &capture), "prime capture");
+        require_hresult(eye.history->commit(capture), "prime commit");
+        require_hresult(eye.synth.submit_prime(capture, views, 0, &eye.ticket), "eye prime");
+        require_hresult(eye.synth.wait_for_previous_submission(5000), "prime drain");
+    }
+    const auto started = std::chrono::steady_clock::now();
+    for (unsigned pair = 1; pair <= 100; ++pair) {
+        for (auto& eye : eyes) {
+            require_hresult(eye.synth.wait_for_previous_submission(5000), "previous drain");
+            require_hresult(eye.synth.synchronize_producer_queue(fixture.queue()), "eye acquire join");
+            xrfg::D3D12HistoryCaptureTicket capture{};
+            require_hresult(eye.history->capture(pair % 2, &capture), "eye capture");
+            require_hresult(eye.history->commit(capture), "eye commit");
+            require_hresult(eye.synth.submit_pair(capture, views, views, 0, pair % 2,
+                &eye.ticket, std::nullopt, {}, true), "eye deferred pair");
+            require(eye.ticket.synthetic_fence_value < eye.ticket.fence_value,
+                "synthetic must complete before the deferred real copy");
+        }
+        // Both eyes have been queued before any consumer join.
+        for (auto& eye : eyes) {
+            require_hresult(eye.synth.synchronize_consumer_queue(fixture.queue(), eye.ticket),
+                "eye consumer join");
+            require_hresult(eye.synth.flush_current_copy(fixture.queue(), eye.ticket.fence_value),
+                "eye deferred copy");
+        }
+    }
+    std::array<std::vector<std::uint8_t>, 2> pixels;
+    for (unsigned e = 0; e < eyes.size(); ++e) {
+        auto& eye = eyes[e];
+        require_hresult(eye.synth.wait_for_idle(), "eye drain");
+        pixels[e] = readback_single_slice(fixture, eye.synthetic.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+        auto actual = readback_single_slice(fixture, eye.current[0].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+        auto expected = readback_single_slice(fixture, eye.source[0].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+        require(actual == expected, "deferred real image was stale or crossed eyes");
+        require_hresult(eye.history->invalidate(), "eye history retire");
+    }
+    fixture.require_no_debug_errors();
+    std::cout << "NVIDIA " << (independent ? "independent" : "shared")
+              << " queues: 100 stereo pairs, "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - started).count() << " ms\n";
+    return pixels;
+}
+
 int main(int argc, char** argv) {
     // V532: off by default in the product; the harness checks it on.
     xrfg::set_hybrid_depth_search(true);
@@ -6179,6 +6278,15 @@ int main(int argc, char** argv) {
         xrfg::bridge_flight_logger().initialize(trace_dir);
     }
     try {
+        if (argc > 1 && std::string_view(argv[1]) == "independent-queues") {
+            SetEnvironmentVariableW(L"XRFG_IGNORE_LIVE_TUNING", L"1");
+            D3D12WarpFixture fixture(true);
+            const auto baseline = test_nvidia_independent_queues(fixture, false);
+            const auto candidate = test_nvidia_independent_queues(fixture, true);
+            require(baseline == candidate, "independent queues changed NVIDIA synthetic pixels");
+            std::cout << "Both eye outputs match shared-queue baseline byte for byte\n";
+            return 0;
+        }
         if (GetEnvironmentVariableA("XRFG_TEST_NVIDIA_QUALITY", nullptr, 0)) {
             run_nvidia_fast_controls();
             return 0;

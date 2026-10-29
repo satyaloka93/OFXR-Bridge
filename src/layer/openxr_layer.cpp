@@ -833,6 +833,8 @@ struct SessionState {
     // flat panels go out as it placed them, neither moved between frames
     // (V508) nor given generated images (V509). Set at session creation.
     bool panel_corrections_off{};
+    bool panel_frame_generation{true};
+    bool independent_synthesis_queues{false};
     // V509: application end frames counted, and the frame each flat panel's
     // swapchain last had its own generated images prepared at, so a panel
     // pairs only straight after a frame that primed or paired it. Panels
@@ -3216,14 +3218,45 @@ create_d3d12_frame_generation_swapchains(
             current_destinations_raw.size(),
             synthetic_destinations_raw.size(),
             state->create_info.arraySize};
+        // Separate single-slice swapchains (Cyberpunk SBS exports one per
+        // eye) must not queue the second eye's pack behind the first eye's
+        // NVIDIA optical-flow wait. Each synthesizer already owns its fences,
+        // work slots and output resources; only the queue was shared.
+        // Keep the producer acquire and consumer hand-over joins unchanged.
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> synthesis_queue =
+            state->session->d3d12_synthesis_queue
+                ? state->session->d3d12_synthesis_queue
+                : state->session->d3d12_queue;
+        bool independent_queue = false;
+        if (state->session->independent_synthesis_queues &&
+            state->session->graphics_binding == SessionGraphicsBinding::d3d12 &&
+            !state->session->d3d11_bridge && !state->session->vulkan_bridge &&
+            state->session->d3d12_synthesis_queue &&
+            state->create_info.arraySize == 1) {
+            auto description = synthesis_queue->GetDesc();
+            Microsoft::WRL::ComPtr<ID3D12CommandQueue> candidate;
+            const HRESULT queue_result = state->session->d3d12_device->CreateCommandQueue(
+                &description, IID_PPV_ARGS(candidate.GetAddressOf()));
+            if (SUCCEEDED(queue_result)) {
+                synthesis_queue = std::move(candidate);
+                independent_queue = true;
+            }
+            // Allocation failure retains the tested shared-queue path.
+            xrfg::bridge_flight_logger().event(
+                xrfg::BridgeFlightOperation::presenter_transition,
+                952, handle_value(state->handle),
+                static_cast<std::uint64_t>(queue_result));
+        }
+        xrfg::bridge_flight_logger().event(
+            xrfg::BridgeFlightOperation::presenter_transition,
+            951, handle_value(state->handle), handle_value(synthesis_queue.Get()),
+            independent_queue ? 1u : 0u);
         const HRESULT gpu_result = initialize_synthesis_with_fallback(
             *state->session, initialize_record,
             [&](xrfg::D3D12OpticalFlowBackend backend) {
         return synthesizer->initialize(
             state->session->d3d12_device.Get(),
-            state->session->d3d12_synthesis_queue
-                ? state->session->d3d12_synthesis_queue.Get()
-                : state->session->d3d12_queue.Get(),
+            synthesis_queue.Get(),
             state->d3d12_history,
             std::span<ID3D12Resource* const>(
                 current_destinations_raw.data(),
@@ -5059,6 +5092,14 @@ XrResult layer_create_session_impl(
     // the private swapchain rings and the admission bounds.
     state->deep_pipeline =
         xrfg::implicit_layer::read_deep_pipeline(current_layer_directory());
+    state->independent_synthesis_queues =
+        xrfg::implicit_layer::read_independent_synthesis_queues(current_layer_directory());
+    state->panel_frame_generation =
+        xrfg::implicit_layer::read_panel_frame_generation(current_layer_directory());
+    // Local diagnostic fork: 950 identifies the independent panel pixel gate.
+    xrfg::bridge_flight_logger().event(
+        xrfg::BridgeFlightOperation::presenter_transition, 950,
+        state->panel_frame_generation ? 1u : 0u);
     const bool triple_requested =
         xrfg::implicit_layer::read_triple_frame_gen(current_layer_directory());
     state->single_swapchain_rings =
@@ -9072,6 +9113,17 @@ void pace_presenter_submission(
 
 void continuous_presenter_main(
     const std::shared_ptr<SessionState>& state) noexcept {
+    // Backport djules75 fe79e2c94940 (V570): prioritize the short,
+    // blocking presenter work without changing GPU ownership or queue depth.
+    const BOOL priority_set =
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    const DWORD priority_error = priority_set ? ERROR_SUCCESS : GetLastError();
+    xrfg::bridge_flight_logger().event(
+        xrfg::BridgeFlightOperation::presenter_transition,
+        773,
+        static_cast<std::uint32_t>(THREAD_PRIORITY_HIGHEST),
+        static_cast<std::uint32_t>(GetThreadPriority(GetCurrentThread())),
+        priority_error);
     for (;;) {
         {
             std::scoped_lock lock(state->presenter_mutex);
@@ -12770,7 +12822,7 @@ constexpr std::size_t kMaxGeneratedPanels = 2;
 [[nodiscard]] bool panel_generation_supported(const SessionState& state) noexcept {
     const bool native = state.graphics_binding == SessionGraphicsBinding::d3d12 &&
         !state.d3d11_bridge && !state.vulkan_bridge && state.d3d12_queue;
-    return native && !state.panel_corrections_off;
+    return native && !state.panel_corrections_off && state.panel_frame_generation;
 }
 
 // The frame's flat panels on swapchains of their own: not one the

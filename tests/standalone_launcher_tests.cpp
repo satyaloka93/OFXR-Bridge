@@ -111,6 +111,8 @@ int main() {
         !contains(default_runtime_ini, "vulkan_session_bridge=1") ||
         !contains(default_runtime_ini, "triple_frame_gen=0") ||
         !contains(default_runtime_ini, "deep_pipeline=1") ||
+        !contains(default_runtime_ini, "panel_frame_generation=1") ||
+        !contains(default_runtime_ini, "independent_synthesis_queues=0") ||
         !release_defaults.vulkan_support ||
         !release_defaults.d3d11_bridge ||
         !contains(default_runtime_ini, "vulkan_bridge=1") ||
@@ -149,6 +151,8 @@ int main() {
     settings.nvidia_input_scale = NvidiaInputScale::quarter;
     settings.nvidia_bidirectional = true;
     settings.deep_pipeline = false;
+    settings.panel_frame_generation = false;
+    settings.independent_synthesis_queues = true;
     settings.triple_frame_gen = true;
     settings.hybrid = true;
     settings.hybrid_depth_search = true;
@@ -169,7 +173,8 @@ int main() {
     if (parsed.backend != FlowBackend::nvidia ||
         parsed.nvidia_preset != NvidiaPerformancePreset::slow ||
         parsed.nvidia_input_scale != NvidiaInputScale::quarter ||
-        !parsed.nvidia_bidirectional || parsed.deep_pipeline ||
+        !parsed.nvidia_bidirectional || parsed.deep_pipeline || parsed.panel_frame_generation ||
+        !parsed.independent_synthesis_queues ||
         !parsed.triple_frame_gen || !parsed.hybrid || !parsed.hybrid_depth_search ||
         parsed.excluded_processes != "Home.exe; Other-Shipping.exe" ||
         parsed.single_swapchain_rings || parsed.vulkan_session_bridge ||
@@ -263,6 +268,8 @@ int main() {
         !contains(runtime_ini, "nvidia_input_scale=25") ||
         !contains(runtime_ini, "nvidia_bidirectional=1") ||
         !contains(runtime_ini, "deep_pipeline=0") ||
+        !contains(runtime_ini, "panel_frame_generation=0") ||
+        !contains(runtime_ini, "independent_synthesis_queues=1") ||
         !contains(runtime_ini, "triple_frame_gen=1") ||
         !contains(runtime_ini, "hybrid=1") ||
         !contains(runtime_ini, "hybrid_depth_search=1") ||

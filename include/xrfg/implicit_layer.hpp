@@ -117,6 +117,16 @@ struct ConfiguredNvidiaOptions {
 [[nodiscard]] bool read_deep_pipeline(
     const std::filesystem::path& module_directory) noexcept;
 
+// `[ofxr] panel_frame_generation`: interpolate pixels inside separate HUD/menu
+// panels. Default on; off preserves panel composition and pose interpolation.
+// Read once per session. Projection-eye frame generation is unaffected.
+// Opt-in separate queues for single-slice native D3D12 swapchains.
+[[nodiscard]] bool read_independent_synthesis_queues(
+    const std::filesystem::path& module_directory) noexcept;
+
+[[nodiscard]] bool read_panel_frame_generation(
+    const std::filesystem::path& module_directory) noexcept;
+
 // `[ofxr] triple_frame_gen`: two synthetic frames per application frame
 // instead of one, for an application running at a third of the display rate.
 // Off unless set to 1. Read at xrCreateSession and then followed while the

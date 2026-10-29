@@ -68,6 +68,7 @@ enum MenuCommand : UINT {
     nvidia_scale_half = 117,
     nvidia_scale_quarter = 129,
     toggle_deep_pipeline = 118,
+    toggle_panel_frame_generation = 143,
     toggle_lower_vram = 126,
     toggle_hybrid = 141,
     toggle_hybrid_depth_search = 142,
@@ -1617,6 +1618,9 @@ void show_context_menu(AppState& state) {
         MF_POPUP,
         reinterpret_cast<UINT_PTR>(nvidia_scale_menu),
         L"Optical flow resolution");
+    AppendMenuW(menu, MF_STRING |
+        (state.settings.panel_frame_generation ? MF_CHECKED : MF_UNCHECKED),
+        toggle_panel_frame_generation, L"HUD panel frame generation (restart game)");
     // 3X needs what "Prefer FPS over latency" sets up, so it holds that on.
     AppendMenuW(
         menu,
@@ -1842,6 +1846,14 @@ void handle_command(AppState& state, UINT command) {
             L"they stay whole on sideways moves. It costs GPU time, a lot at "
             L"high headset resolutions; leave it off if your frame rate drops "
             L"with Hybrid. A running game switches within a second.");
+        break;
+    case toggle_panel_frame_generation:
+        state.settings.panel_frame_generation = !state.settings.panel_frame_generation;
+        update_runtime_options(state);
+        show_balloon(state, L"HUD panel frame generation",
+            L"Off saves the optical-flow work inside separate HUD/menu panels. "
+            L"Their positioning and display remain; content updates at game FPS. "
+            L"Eye frame generation is unchanged. Restart the game to apply.");
         break;
     case toggle_deep_pipeline:
         if (state.settings.triple_frame_gen) {

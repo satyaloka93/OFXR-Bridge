@@ -907,7 +907,30 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 "${CMAKE_CURRENT_BINARY_DIR}/xrfg-layer-split-eye-call-chain-test.log"
                 split-eye)
 
+        foreach(queue_depth IN ITEMS 0 1)
+            add_test(NAME xrfg_layer_independent_queues_${queue_depth}
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DLAYER_DLL=$<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>"
+                    "-DCALL_CHAIN=$<TARGET_FILE:xrfg_layer_call_chain>"
+                    "-DPIPELINE_INI=${CMAKE_CURRENT_SOURCE_DIR}/tests/independent-queues-${queue_depth}.ini"
+                    "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/independent-queues-${queue_depth}"
+                    -DEXPECT_INDEPENDENT_QUEUES=1
+                    -DMODE=split-eye
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/layer_call_chain_depth.cmake")
+        endforeach()
+
         # V509: a HUD quad on a swapchain of its own gets generated images.
+        foreach(panel_depth IN ITEMS 0 1)
+            add_test(NAME xrfg_layer_hud_panel_off_${panel_depth}
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DLAYER_DLL=$<TARGET_FILE:XR_APILAYER_XRFrameBridge_diagnostic>"
+                    "-DCALL_CHAIN=$<TARGET_FILE:xrfg_layer_call_chain>"
+                    "-DPIPELINE_INI=${CMAKE_CURRENT_SOURCE_DIR}/tests/hud-panel-off-${panel_depth}.ini"
+                    "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/hud-panel-off-${panel_depth}"
+                    -DMODE=hud-panel
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/layer_call_chain_depth.cmake")
+        endforeach()
+
         add_test(
             NAME xrfg_layer_hud_panel_call_chain
             COMMAND xrfg_layer_call_chain
