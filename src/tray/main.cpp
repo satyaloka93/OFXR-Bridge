@@ -69,6 +69,7 @@ enum MenuCommand : UINT {
     nvidia_scale_quarter = 129,
     toggle_deep_pipeline = 118,
     toggle_panel_frame_generation = 143,
+    toggle_independent_synthesis_queues = 144,
     toggle_lower_vram = 126,
     toggle_hybrid = 141,
     toggle_hybrid_depth_search = 142,
@@ -1621,6 +1622,9 @@ void show_context_menu(AppState& state) {
     AppendMenuW(menu, MF_STRING |
         (state.settings.panel_frame_generation ? MF_CHECKED : MF_UNCHECKED),
         toggle_panel_frame_generation, L"HUD panel frame generation (restart game)");
+    AppendMenuW(menu, MF_STRING |
+        (state.settings.independent_synthesis_queues ? MF_CHECKED : MF_UNCHECKED),
+        toggle_independent_synthesis_queues, L"Independent eye synthesis queues (restart game)");
     // 3X needs what "Prefer FPS over latency" sets up, so it holds that on.
     AppendMenuW(
         menu,
@@ -1854,6 +1858,18 @@ void handle_command(AppState& state, UINT command) {
             L"Off saves the optical-flow work inside separate HUD/menu panels. "
             L"Their positioning and display remain; content updates at game FPS. "
             L"Eye frame generation is unchanged. Restart the game to apply.");
+        break;
+    case toggle_independent_synthesis_queues:
+        state.settings.independent_synthesis_queues = !state.settings.independent_synthesis_queues;
+        update_runtime_options(state);
+        show_balloon(state,
+            state.settings.independent_synthesis_queues
+                ? L"Independent eye synthesis queues: on"
+                : L"Independent eye synthesis queues: off",
+            L"On gives each eye's frame generation its own high-priority GPU "
+            L"queue so both eyes can overlap; off shares one queue. Quality is "
+            L"unchanged. Native D3D12 single-image swapchains only. Restart the "
+            L"game to apply.");
         break;
     case toggle_deep_pipeline:
         if (state.settings.triple_frame_gen) {
