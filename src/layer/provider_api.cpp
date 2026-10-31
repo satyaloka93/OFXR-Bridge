@@ -1,4 +1,5 @@
 #include "xrfg/provider_api.hpp"
+#include "xrfg/bridge_flight_logger.hpp"
 
 #include "xrfg/dlss_motion_vectors.hpp"
 #include "xrfg/embedded_control.hpp"
@@ -381,4 +382,9 @@ extern "C" __declspec(dllexport) int OFXR_GetDlssGuideStatisticsV2(
     } catch (...) {
         return 0;
     }
+}
+
+// Private-host receipt: requested INI state is not proof that a file opened.
+extern "C" __declspec(dllexport) int OFXR_IsFlightRecordingV1() noexcept {
+    return xrfg::bridge_flight_logger().enabled() ? 1 : 0;
 }
