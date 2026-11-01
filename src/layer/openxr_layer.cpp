@@ -2386,6 +2386,7 @@ struct SwapchainState {
     // decision waits until xrEndFrame names this swapchain as a projection
     // view. Guarded by call_mutex.
     bool generation_eligible_pending{};
+    bool native_history_suspended{}; // call_mutex; rebuild after a host-requested trim
     std::uint32_t enumerated_image_count{};
     // An attempt that failed for its own reasons -- synthesis, interop -- is
     // not retried every frame. Cleared whenever the history is rebuilt, which
@@ -5773,7 +5774,7 @@ XrResult layer_wait_frame_impl(
         // resume promotes it again.
         if (state->pipelined_wait_streak >= 2 &&
             state->last_inline_frame_state_valid &&
-            !state->pause_applied &&
+            !state->pause_applied && state->menu_enabled &&
             !presenter_forbidden(*state)) {
             // The current runtime frame is still owned by the render thread,
             // so the transition cannot start its presenter until xrEndFrame
@@ -13717,6 +13718,20 @@ void apply_embedded_control(
     }
     for (const auto& chain : swapchains) {
         std::unique_lock lock(chain->mutex);
+        if (chain->native_history_suspended && control.desired.enabled && !paused) {
+            const auto release = required_release_state(*chain);
+            std::vector<ID3D12Resource*> images;
+            for (const auto& image : chain->enumerated_d3d12_images) images.push_back(image.Get());
+            auto history = std::make_shared<xrfg::D3D12SwapchainHistory>();
+            result = release && !images.empty()
+                ? history->initialize(state->d3d12_device.Get(), state->d3d12_queue.Get(), images, *release)
+                : E_FAIL;
+            if (FAILED(result)) break;
+            chain->d3d12_history = std::move(history);
+            chain->native_history_suspended = false;
+            xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::embedded_configuration,
+                882, handle_value(chain->handle), images.size(), 0);
+        }
         // The same gates the enumeration path applies, and for the same reason.
         //
         // This loop used to build generation for every colour swapchain in the
@@ -14472,8 +14487,11 @@ XrResult layer_end_frame_impl(
             // SteamVR's 72 Hz had every one mispresented, and the overlay
             // read 30-35 delivered. Off, the runtime paces the game as it
             // would without the layer.
-            if (use_continuous_presenter &&
-                (!pipelined_presenter_mode || state->pause_applied)) {
+            // A provisional overlapping wait may have started a presenter in
+            // this very bypass call. Include it when handing native ownership
+            // back; the entry-time snapshot alone misses that transition.
+            if ((use_continuous_presenter || continuous_presenter_active(state)) &&
+                (!pipelined_presenter_mode || state->pause_applied || !state->menu_enabled)) {
                 stop_continuous_presenter(state);
                 if (pipelined_presenter_mode) {
                     // The application's next wait, already answered by the
@@ -14495,7 +14513,7 @@ XrResult layer_end_frame_impl(
                         state->application_begin_needs_wait ? 1 : 0,
                         0,
                         0);
-                } else if (state->pause_applied) {
+                } else if (state->pause_applied || !state->menu_enabled) {
                     state->presenter_restore_after_pause = true;
                 } else if (reason != GenerationPrepareReason::manual_disarmed) {
                     state->presenter_restore_after_bypass = true;
@@ -15951,4 +15969,54 @@ extern "C" __declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoade
         layer_request ? layer_request->layerInterfaceVersion : 0,
         layer_request ? layer_request->layerApiVersion : 0);
     return result;
+}
+
+// Private host only: call after a successful disabled frame, before starting a
+// different generator. Never unload hooks or release application-owned images.
+// 1=trim complete, 0=still active/busy, -1=drain/unsupported-session failure.
+extern "C" __declspec(dllexport) int OFXR_TrimInactiveSessionV1(std::uint64_t handle) noexcept {
+    try {
+        const auto session = find_session(reinterpret_cast<XrSession>(handle));
+        if (!session) return -1;
+        std::unique_lock frame_lock(session->frame_call_mutex, std::try_to_lock);
+        if (!frame_lock.owns_lock() || session->menu_enabled || continuous_presenter_active(session)) return 0;
+        if (session->graphics_binding != SessionGraphicsBinding::d3d12 || session->d3d11_bridge || session->vulkan_bridge) return -1;
+        std::uint64_t generations = 0, histories = 0;
+        log_video_memory(*session, VideoMemoryStage::periodic, 880);
+        for (const auto& chain : find_swapchains(session)) {
+            std::scoped_lock call_lock(chain->call_mutex);
+            std::scoped_lock gpu_lock(session->gpu_mutex);
+            std::shared_ptr<FrameGenerationSwapchainState> generation;
+            std::shared_ptr<xrfg::D3D12SwapchainHistory> history;
+            {
+                std::scoped_lock lock(chain->mutex);
+                generation = chain->frame_generation;history = chain->d3d12_history;
+            }
+            HRESULT result = S_OK;
+            if (generation && generation->synthesizer) result = generation->synthesizer->wait_for_idle();
+            if (SUCCEEDED(result) && history) result = history->wait_for_idle();
+            if (SUCCEEDED(result) && generation && generation->interop) result = generation->interop->wait_for_idle();
+            if (FAILED(result)) {
+                xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::embedded_configuration,
+                    881, handle_value(chain->handle), static_cast<std::uint32_t>(result), 0);
+                return -1;
+            }
+            if (generation) {
+                destroy_frame_generation_swapchains(chain);
+                generation.reset();++generations;
+                chain->generation_eligible_pending = true;
+            }
+            if (history) {
+                std::scoped_lock lock(chain->mutex);
+                chain->last_released_capture.reset();chain->last_released_motion_vectors.reset();
+                chain->pending_end_frame_capture.reset();
+                chain->d3d12_history.reset();history.reset();
+                chain->native_history_suspended = true;++histories;
+            }
+        }
+        log_video_memory(*session, VideoMemoryStage::periodic, 881);
+        xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::embedded_configuration,
+            880, generations, histories, 0);
+        return 1;
+    } catch (...) { return -1; }
 }

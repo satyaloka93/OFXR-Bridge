@@ -388,3 +388,6 @@ extern "C" __declspec(dllexport) int OFXR_GetDlssGuideStatisticsV2(
 extern "C" __declspec(dllexport) int OFXR_IsFlightRecordingV1() noexcept {
     return xrfg::bridge_flight_logger().enabled() ? 1 : 0;
 }
+
+// Host must wait for a completed frame and an applied disabled receipt before native generation.
+extern "C" __declspec(dllexport) int OFXR_SupportsNativeHandoffV1() noexcept { return 1; }
